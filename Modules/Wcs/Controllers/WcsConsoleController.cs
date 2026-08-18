@@ -1,3 +1,4 @@
+using GrcsBackend.Modules.Automation.Services;
 using GrcsBackend.Modules.Wcs.Models;
 using GrcsBackend.Modules.Wcs.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -14,18 +15,20 @@ public class WcsConsoleController : ControllerBase
 {
     private readonly IAdmittanceService _admittance;
     private readonly ITaskStageService _stages;
+    private readonly SignalAutoHostedService _signals;
 
-    public WcsConsoleController(IAdmittanceService admittance, ITaskStageService stages)
+    public WcsConsoleController(IAdmittanceService admittance, ITaskStageService stages, SignalAutoHostedService signals)
     {
         _admittance = admittance;
         _stages = stages;
+        _signals = signals;
     }
 
-    /// <summary>当前状态：是否自动模式 + 待确认数。</summary>
+    /// <summary>当前状态：是否自动模式 + 待确认数（自动模式读统一信号源 SignalAutoHostedService）。</summary>
     [HttpGet("status")]
     public ActionResult<object> Status()
     {
-        return Ok(new { autoMode = _admittance.IsAutoMode, pendingCount = _admittance.PendingCount });
+        return Ok(new { autoMode = _signals.AdmittanceAuto, pendingCount = _admittance.PendingCount });
     }
 
     /// <summary>进入申请事件列表（前端轮询，按时间正序）。</summary>
@@ -59,14 +62,6 @@ public class WcsConsoleController : ControllerBase
     {
         _stages.RemoveByTaskId(taskId);
         return Ok(new { success = true, taskId });
-    }
-
-    /// <summary>切换准入模式：auto=true 全自动放行，false 手动确认。</summary>
-    [HttpPost("mode")]
-    public ActionResult<object> SetMode([FromBody] ModeRequest request)
-    {
-        _admittance.SetAutoMode(request.Auto);
-        return Ok(new { success = true, autoMode = _admittance.IsAutoMode });
     }
 
     /// <summary>删除单个进入申请事件。</summary>

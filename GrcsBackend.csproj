@@ -9,6 +9,8 @@
   <ItemGroup>
     <!-- NewtonsoftJson：GRCS 用 Newtonsoft 按 yyyy-MM-dd HH:mm:ss.fff 解析响应，必须对齐 -->
     <PackageReference Include="Microsoft.AspNetCore.Mvc.NewtonsoftJson" Version="10.0.9" />
+    <!-- SQLite：台账/范围配置/地图缓存/货物码持久化（纯托管 + 预编译 bundle，免装） -->
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.9" />
   </ItemGroup>
 
 </Project>

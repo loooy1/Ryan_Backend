@@ -16,12 +16,6 @@ public class EntryRequestEvent
     public int Attempts { get; set; }
 }
 
-/// <summary>模式切换请求体。</summary>
-public class ModeRequest
-{
-    public bool Auto { get; set; }
-}
-
 /// <summary>批准/拒绝请求体。</summary>
 public class DecisionRequest
 {

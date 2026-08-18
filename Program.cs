@@ -1,3 +1,4 @@
+using GrcsBackend.Modules.Automation;
 using GrcsBackend.Modules.Wcs;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -28,6 +29,7 @@ builder.Services.AddCors(options =>
 
 // 模块注册（后续新增模块在此挂接）
 builder.Services.AddWcsModule();
+builder.Services.AddAutomationModule();
 
 var app = builder.Build();
 

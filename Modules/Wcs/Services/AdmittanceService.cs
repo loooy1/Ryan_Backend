@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using GrcsBackend.Modules.Automation.Services;
 using GrcsBackend.Modules.Wcs.Models;
 
 namespace GrcsBackend.Modules.Wcs.Services;
@@ -35,6 +36,7 @@ public interface IAdmittanceService
 public class AdmittanceService : IAdmittanceService
 {
     private readonly ILogger<AdmittanceService> _logger;
+    private readonly SignalAutoHostedService _signals;
 
     private readonly object _lock = new();
     private readonly List<EntryRequestEvent> _events = [];
@@ -42,22 +44,24 @@ public class AdmittanceService : IAdmittanceService
     private long _nextId = 1;
     private const int MaxEvents = 500;
 
-    /// <summary>自动放行模式（默认关闭：手动确认，前端批准后放行）。</summary>
-    public bool IsAutoMode { get; private set; }
+    /// <summary>自动放行模式（默认关闭：手动确认，前端批准后放行）。
+    /// 统一数据源在 SignalAutoHostedService（/api/wcs/auto/signals 写入，SQLite 持久化）。</summary>
+    public bool IsAutoMode => _signals.AdmittanceAuto;
 
     public int PendingCount
     {
         get { lock (_lock) return _events.Count(e => e.Status == "Pending"); }
     }
 
-    public AdmittanceService(ILogger<AdmittanceService> logger)
+    public AdmittanceService(SignalAutoHostedService signals, ILogger<AdmittanceService> logger)
     {
+        _signals = signals;
         _logger = logger;
     }
 
     public void SetAutoMode(bool auto)
     {
-        IsAutoMode = auto;
+        _signals.SetAdmittance(auto);
         _logger.LogInformation("准入模式切换为 {Mode}", auto ? "全自动放行" : "手动确认");
     }
 
