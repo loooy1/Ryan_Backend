@@ -71,7 +71,7 @@ public class AdmittanceService : IAdmittanceService
 
         if (IsAutoMode)
         {
-            RecordEvent(key, request, "Allowed");
+            RecordEvent(key, request, "Allowed", DateTime.Now);
             return true;
         }
 
@@ -102,8 +102,12 @@ public class AdmittanceService : IAdmittanceService
         lock (_lock)
         {
             var evt = _events.LastOrDefault(e => e.Key == key);
-            if (evt != null && evt.Status == "Pending")
-                evt.Status = "Approved";
+            if (evt != null)
+            {
+                if (evt.Status == "Pending")
+                    evt.Status = "Approved";
+                evt.DecidedAt = DateTime.Now;
+            }
         }
         _logger.LogInformation("WCS 前端决策 {Decision}: {Key}（等待 GRCS 下次重试时领取）", allow ? "批准" : "拒绝", key);
     }
@@ -128,7 +132,7 @@ public class AdmittanceService : IAdmittanceService
         }
     }
 
-    private void RecordEvent(string key, StationEntryRequestModel request, string status)
+    private void RecordEvent(string key, StationEntryRequestModel request, string status, DateTime? decidedAt = null)
     {
         lock (_lock)
         {
@@ -141,6 +145,7 @@ public class AdmittanceService : IAdmittanceService
                 existing.Time = DateTime.Now;
                 existing.Attempts++;
                 existing.Status = status;
+                existing.DecidedAt = decidedAt ?? existing.DecidedAt;
                 return;
             }
             _events.Add(new EntryRequestEvent
@@ -151,6 +156,7 @@ public class AdmittanceService : IAdmittanceService
                 StationCode = request.StationCode,
                 IsLoaded = request.IsLoaded,
                 Time = DateTime.Now,
+                DecidedAt = decidedAt,
                 Status = status,
                 Attempts = 1
             });

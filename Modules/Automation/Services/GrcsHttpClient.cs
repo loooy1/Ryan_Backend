@@ -95,4 +95,17 @@ public class GrcsHttpClient
         }
         catch (Exception ex) { return (false, 0, JsonSerializer.Serialize(new { error = ex.Message })); }
     }
+
+    /// <summary>存活探测：GET 根路径，能拿到任意状态码即视为可达（2 秒短超时，供健康轮询）。</summary>
+    public async Task<bool> PingAsync(string baseUrl)
+    {
+        try
+        {
+            var c = NewClient();
+            c.Timeout = TimeSpan.FromSeconds(2);
+            using var resp = await c.GetAsync(baseUrl.TrimEnd('/') + "/");
+            return true;
+        }
+        catch { return false; }
+    }
 }

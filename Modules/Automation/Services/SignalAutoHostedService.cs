@@ -20,6 +20,7 @@ public class SignalAutoHostedService : IHostedService
     private readonly AutomationLogService _logs;
     private readonly ITaskStageService _stages;
     private readonly AutomationDb _db;
+    private readonly SignalConfirmStore _confirm;
     private readonly object _lock = new();
     private CancellationTokenSource? _cts;
 
@@ -36,7 +37,8 @@ public class SignalAutoHostedService : IHostedService
     private static readonly System.Text.Json.JsonSerializerOptions Opts = new() { PropertyNameCaseInsensitive = true };
 
     public SignalAutoHostedService(GrcsHttpClient grcs, MapStoreService mapStore, WcsSettingsService settings,
-        CargoCodeStore cargoCodes, LedgerStore ledger, AutomationLogService logs, ITaskStageService stages, AutomationDb db)
+        CargoCodeStore cargoCodes, LedgerStore ledger, AutomationLogService logs, ITaskStageService stages, AutomationDb db,
+        SignalConfirmStore confirm)
     {
         _grcs = grcs;
         _mapStore = mapStore;
@@ -46,6 +48,7 @@ public class SignalAutoHostedService : IHostedService
         _logs = logs;
         _stages = stages;
         _db = db;
+        _confirm = confirm;
         LoadFlags();
     }
 
@@ -89,7 +92,7 @@ public class SignalAutoHostedService : IHostedService
         var ledger = _ledger.Get(2000);
         if (ArrivalAuto) await TickArrivalAsync(ledger, finished, mapStations);
         if (RemovalAuto) await TickRemovalAsync(ledger, finished, mapStations);
-        if (AutoSend) await TickSortingAsync(mapStations);
+        if (AutoSend) await TickSortingAsync(ledger, mapStations);
     }
 
     // ── 货物到达：自动段1（空托入库 FINISHED）→ container_ready ──
@@ -116,7 +119,12 @@ public class SignalAutoHostedService : IHostedService
                 ContainerCode = cargoCode,
                 StationCode = ToWcsCode(st ?? "", mapStations),
             });
-            if (ok) { lock (_lock) { _arrivalConfirmed.Add(t.TaskId); } _logs.Add("✓ container_ready " + t.TaskId + "（货 " + cargoCode + "）", "#4ade80"); }
+            if (ok)
+            {
+                lock (_lock) { _arrivalConfirmed.Add(t.TaskId); }
+                _confirm.Set("arrival", t.TaskId, null);   // 统一写入 workflow_state（前端 1s 轮询可见）
+                _logs.Add("✓ container_ready " + t.TaskId + "（货 " + cargoCode + "）", "#4ade80");
+            }
             else _logs.Add("❌ container_ready " + t.TaskId + " 发送失败 HTTP " + code, "#f87171");
         }
     }
@@ -144,13 +152,18 @@ public class SignalAutoHostedService : IHostedService
                 ContainerCode = containerCode,
                 StationCode = ToWcsCode(st ?? "", mapStations),
             });
-            if (ok) { lock (_lock) { _removalConfirmed.Add(t.TaskId); } _logs.Add("✓ container_remove " + t.TaskId + "（容器 " + containerCode + "）", "#4ade80"); }
+            if (ok)
+            {
+                lock (_lock) { _removalConfirmed.Add(t.TaskId); }
+                _confirm.Set("removal", t.TaskId, null);   // 统一写入 workflow_state
+                _logs.Add("✓ container_remove " + t.TaskId + "（容器 " + containerCode + "）", "#4ade80");
+            }
             else _logs.Add("❌ container_remove " + t.TaskId + " 发送失败 HTTP " + code, "#f87171");
         }
     }
 
     // ── 分拣完成：FINISHED 且站点是分拣台 → container_operation_finish ──
-    private async Task TickSortingAsync(List<MapStationLite> mapStations)
+    private async Task TickSortingAsync(List<TaskLedgerEntry> ledger, List<MapStationLite> mapStations)
     {
         var settings = _settings.Get();
         var events = _stages.GetEventsSince(0);
@@ -176,6 +189,29 @@ public class SignalAutoHostedService : IHostedService
             });
             if (!ok) { _logs.Add("❌ 分拣 " + sendTaskId + " 发送失败 HTTP " + code, "#f87171"); continue; }
             lock (_lock) { _ssSent.Add(e.TaskId); }
+            // 统一写入 workflow_state（value 存发送参数，前端 Sent 卡片重建用）
+            var paramsJson = System.Text.Json.JsonSerializer.Serialize(new
+            {
+                returnTaskId = sendTaskId,
+                removeContainer = false,
+                destStation = "",
+                destArea = "",
+            });
+            _confirm.Set("sent", e.TaskId, paramsJson);
+            // 回库任务写台账（TaskType=SORTING_RETURN，对应分拣段1 TaskId+"_R"，供任务看板关联显示）
+            var seg1 = ledger.FirstOrDefault(x => x.TaskId == e.TaskId);
+            await _ledger.AppendAsync([new TaskLedgerEntry
+            {
+                TaskId = sendTaskId,
+                TaskType = "SORTING_RETURN",
+                ContainerCode = seg1?.ContainerCode ?? e.ContainerCode,
+                CargoCode = seg1?.CargoCode ?? "",
+                StationCode = [],
+                Warehouse = e.Warehouse,
+                Time = DateTime.Now.ToString("O"),
+                Ok = true,
+                StatusCode = code
+            }]);
             _logs.Add("✓ container_operation_finish " + sendTaskId, "#4ade80");
         }
     }
@@ -201,12 +237,28 @@ public class SignalAutoHostedService : IHostedService
             ArrivalAuto = bool.TryParse(_db.KvGet("sig_arrival_auto"), out var a) && a;
             RemovalAuto = bool.TryParse(_db.KvGet("sig_removal_auto"), out var r) && r;
             AutoSend = bool.TryParse(_db.KvGet("sig_ss_auto"), out var s) && s;
-            _arrivalConfirmed = LoadSet("sig_arrival_confirmed");
-            _removalConfirmed = LoadSet("sig_removal_confirmed");
-            _ssSent = LoadSet("sig_ss_sent");
+            // 一次性迁移：旧 kv 确认集合 → workflow_state 表（幂等 Set，仅插入缺失项）
+            MigrateLegacy("sig_arrival_confirmed", "arrival");
+            MigrateLegacy("sig_removal_confirmed", "removal");
+            MigrateLegacy("sig_ss_sent", "sent");
+            _arrivalConfirmed = LoadConfirmSet("arrival");
+            _removalConfirmed = LoadConfirmSet("removal");
+            _ssSent = LoadConfirmSet("sent");
         }
         catch { }
     }
+
+    /// <summary>旧 kv 集合迁移到 workflow_state（Set 幂等，重复调用无副作用）。</summary>
+    private void MigrateLegacy(string kvKey, string kind)
+    {
+        foreach (var id in LoadSet(kvKey))
+            _confirm.Set(kind, id, null);
+    }
+
+    private HashSet<string> LoadConfirmSet(string kind)
+        => _confirm.GetAll().TryGetValue(kind, out var rows)
+            ? rows.Select(r => r.TaskId).ToHashSet(StringComparer.OrdinalIgnoreCase)
+            : [];
 
     private void SaveFlags()
     {
@@ -216,9 +268,6 @@ public class SignalAutoHostedService : IHostedService
             _db.KvSet("sig_arrival_auto", ArrivalAuto.ToString().ToLowerInvariant());
             _db.KvSet("sig_removal_auto", RemovalAuto.ToString().ToLowerInvariant());
             _db.KvSet("sig_ss_auto", AutoSend.ToString().ToLowerInvariant());
-            _db.KvSet("sig_arrival_confirmed", System.Text.Json.JsonSerializer.Serialize(_arrivalConfirmed));
-            _db.KvSet("sig_removal_confirmed", System.Text.Json.JsonSerializer.Serialize(_removalConfirmed));
-            _db.KvSet("sig_ss_sent", System.Text.Json.JsonSerializer.Serialize(_ssSent));
         }
         catch { }
     }

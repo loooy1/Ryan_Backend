@@ -1,4 +1,7 @@
+using GrcsBackend.Modules.Automation.Services;
 using GrcsBackend.Modules.Wcs.Models;
+using GrcsBackend.Modules.Wcs.SignalR;
+using Microsoft.AspNetCore.SignalR;
 
 namespace GrcsBackend.Modules.Wcs.Services;
 
@@ -38,14 +41,36 @@ public interface ITaskStageService
 public class TaskStageService : ITaskStageService
 {
     private readonly object _lock = new();
+    private readonly IHubContext<TaskStageRealtimeHub> _hub;
+    private readonly AutomationDb _db;
     private readonly List<StageChangeEvent> _events = [];
     private readonly HashSet<string> _finished = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _seenKeys = new(StringComparer.Ordinal);   // 幂等：taskId|stage|timeTicks
     private readonly Dictionary<string, TaskCompletionSource<bool>> _waiters = new(StringComparer.OrdinalIgnoreCase);
     private long _nextId = 1;
     private const int MaxEvents = 1000;
     private const int MaxFinished = 3000;
 
     public event Action<StageChangeEvent>? StageRecorded;
+
+    public TaskStageService(IHubContext<TaskStageRealtimeHub> hub, AutomationDb db)
+    {
+        _hub = hub;
+        _db = db;
+        // 启动时从 SQLite 恢复（重启不丢），并恢复 Id 水位与 FINISHED 集合
+        var loaded = _db.StageLoadAll();
+        foreach (var e in loaded)
+        {
+            _events.Add(e);
+            _seenKeys.Add(DedupKey(e.TaskId, e.Stage, e.Time));
+            if (string.Equals(e.Stage, "FINISHED", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrEmpty(e.TaskId))
+                _finished.Add(e.TaskId);
+            if (e.Id >= _nextId) _nextId = e.Id + 1;
+        }
+        if (_events.Count > MaxEvents)
+            _events.RemoveRange(0, _events.Count - MaxEvents);
+        if (_finished.Count > MaxFinished) _finished.Clear();
+    }
 
     public HashSet<string> FinishedTaskIds
     {
@@ -54,6 +79,13 @@ public class TaskStageService : ITaskStageService
 
     public void Record(TaskStageChangeModel change)
     {
+        // 幂等：GRCS 重发同一条（同任务同阶段同时刻）直接跳过，防流水重复
+        var dedupKey = DedupKey(change.TaskId, change.Stage, change.MsgTime);
+        lock (_lock)
+        {
+            if (!_seenKeys.Add(dedupKey)) return;
+        }
+
         StageChangeEvent ev;
         lock (_lock)
         {
@@ -79,7 +111,10 @@ public class TaskStageService : ITaskStageService
                     tcs.TrySetResult(true);
             }
         }
+        _db.StageInsert(ev);   // 持久化（锁外 IO）
         StageRecorded?.Invoke(ev);
+        // 实时推送：新事件广播给所有已连接的 WCS 前端（锁外发，避免持锁做网络 IO）
+        _ = _hub.Clients.All.SendAsync("EventAdded", ev);
     }
 
     public List<StageChangeEvent> GetEvents(int limit = 200)
@@ -110,7 +145,13 @@ public class TaskStageService : ITaskStageService
             _events.RemoveAll(e => e.TaskId == taskId);
             _finished.Remove(taskId);
         }
+        _db.StageRemoveByTaskId(taskId);   // 同步删库
+        // 实时推送：通知各标签页同步删除本地缓存
+        _ = _hub.Clients.All.SendAsync("TaskRemoved", taskId);
     }
+
+    private static string DedupKey(string taskId, string stage, DateTime time)
+        => $"{taskId}|{stage}|{time.Ticks}";
 
     /// <summary>
     /// 等待任务到达 FINISHED：进程内事件驱动（GRCS 回调 task_stage_change 直达本进程），

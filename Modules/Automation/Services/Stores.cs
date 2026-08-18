@@ -193,3 +193,26 @@ public class LedgerStore
 
     public void Clear() => _db.LedgerClear();
 }
+
+/// <summary>
+/// 信号确认状态（SQLite workflow_state 表，kind = arrival / removal / sent）。
+/// Set 是幂等抢占：新插入返回 true（claimed），已存在返回 false——前端据此
+/// 在发信号前抢占，防止多标签页对同一任务重复发送 WCS 信号。
+/// </summary>
+public class SignalConfirmStore
+{
+    private readonly AutomationDb _db;
+
+    public SignalConfirmStore(AutomationDb db) => _db = db;
+
+    public bool Set(string kind, string taskId, string? value)
+        => _db.WorkflowSet(kind, taskId, value, DateTime.Now.ToString("O"));
+
+    public void Remove(string kind, string taskId) => _db.WorkflowRemove(kind, taskId);
+
+    /// <summary>全部确认状态按 kind 分组返回。</summary>
+    public Dictionary<string, List<Models.WorkflowStateRow>> GetAll()
+        => _db.WorkflowGetAll()
+            .GroupBy(r => r.Kind)
+            .ToDictionary(g => g.Key, g => g.ToList());
+}

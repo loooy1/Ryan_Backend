@@ -168,8 +168,8 @@ public class CargoInventoryItem
     public string? CurrentCargoAreaName { get; set; }
     public string? CurrentOrderId { get; set; }
 
-    public bool IsPallet() => Code?.StartsWith("Container", StringComparison.OrdinalIgnoreCase) ?? false;
-    public bool IsCargo() => Code?.StartsWith("Cargo", StringComparison.OrdinalIgnoreCase) ?? false;
+    public bool IsPallet() => Code?.Contains("Container", StringComparison.OrdinalIgnoreCase) ?? false;
+    public bool IsCargo() => Code?.Contains("Cargo", StringComparison.OrdinalIgnoreCase) ?? false;
 }
 
 /// <summary>发送给 GRCS 的任务组（/api/v1/task_receive）。</summary>

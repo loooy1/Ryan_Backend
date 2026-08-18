@@ -19,6 +19,7 @@ public static class AutomationModuleExtensions
         services.AddSingleton<CargoCodeStore>();
         services.AddSingleton<StationLockStore>();
         services.AddSingleton<LedgerStore>();
+        services.AddSingleton<SignalConfirmStore>();
         services.AddSingleton<GrcsHttpClient>();
         // 轮询/批量互斥闸（多标签页也能保证只有一个在执行）
         services.AddSingleton<AutomationGate>();

@@ -20,12 +20,21 @@ builder.Services.AddControllers().AddNewtonsoftJson(options =>
 });
 
 // CORS：允许模拟器（浏览器 WASM）调试时直接访问本服务。
-// 生产环境应收紧为前端实际域名。
+// 注意：SignalR JS 客户端默认带凭证（withCredentials=true），浏览器禁止凭证请求匹配
+// AllowAnyOrigin() 的 `*`，否则 negotiate 被拦截（Failed to fetch）。
+// 必须回显具体来源 SetIsOriginAllowed(_ => true) + AllowCredentials()。
+// 生产环境应收紧为前端实际域名：.SetIsOriginAllowed(h => h == "https://front.example.com")。
 builder.Services.AddCors(options =>
 {
     options.AddDefaultPolicy(policy =>
-        policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod());
+        policy.SetIsOriginAllowed(_ => true)
+              .AllowAnyHeader()
+              .AllowAnyMethod()
+              .AllowCredentials());
 });
+
+// SignalR：任务阶段事件实时推送（前端不再轮询 task-stages）
+builder.Services.AddSignalR();
 
 // 模块注册（后续新增模块在此挂接）
 builder.Services.AddWcsModule();
@@ -35,5 +44,6 @@ var app = builder.Build();
 
 app.UseCors();
 app.MapControllers();
+app.MapHub<GrcsBackend.Modules.Wcs.SignalR.TaskStageRealtimeHub>("/hubs/task-stages");
 
 app.Run();

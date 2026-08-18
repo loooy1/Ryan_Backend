@@ -97,6 +97,14 @@ public class GrcsProxyController : ControllerBase
         if (!ok) return Ok(new { ok = false, code, json = error });
         return File(bytes, "application/octet-stream", "map.zip");
     }
+
+    /// <summary>GRCS 存活探测代理（前端健康轮询用；轻量，2 秒短超时）。</summary>
+    [HttpGet("health")]
+    public async Task<ActionResult<object>> Health()
+    {
+        var ok = await _grcs.PingAsync(BaseUrl);
+        return Ok(new { ok });
+    }
 }
 
 public class ContainerReadyDto
