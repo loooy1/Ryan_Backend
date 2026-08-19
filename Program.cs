@@ -1,4 +1,3 @@
-using GrcsBackend.Modules.Automation;
 using GrcsBackend.Modules.Wcs;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -36,14 +35,13 @@ builder.Services.AddCors(options =>
 // SignalR：任务阶段事件实时推送（前端不再轮询 task-stages）
 builder.Services.AddSignalR();
 
-// 模块注册（后续新增模块在此挂接）
+// 模块注册（Wcs 总模块含 Automation/Proxy/Console/Realtime 子模块）
 builder.Services.AddWcsModule();
-builder.Services.AddAutomationModule();
 
 var app = builder.Build();
 
 app.UseCors();
 app.MapControllers();
-app.MapHub<GrcsBackend.Modules.Wcs.SignalR.TaskStageRealtimeHub>("/hubs/task-stages");
+app.MapHub<GrcsBackend.Modules.Wcs.Realtime.TaskStageRealtimeHub>("/hubs/task-stages");
 
 app.Run();
