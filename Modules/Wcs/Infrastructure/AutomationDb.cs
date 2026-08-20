@@ -1,6 +1,6 @@
 using Microsoft.Data.Sqlite;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services;
+namespace GrcsBackend.Modules.Wcs.Infrastructure;
 
 /// <summary>
 /// SQLite 基础设施（单文件 grcs.db 放 ContentRoot）。

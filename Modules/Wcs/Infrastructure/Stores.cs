@@ -1,8 +1,8 @@
 using System.Text.Json;
-using GrcsBackend.Modules.Wcs.Automation.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Console.Services;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services;
+namespace GrcsBackend.Modules.Wcs.Infrastructure;
 
 /// <summary>站点池缓存（地图上传/GRCS 拉取后持久化，重启不丢）。Singleton。</summary>
 public class MapStoreService

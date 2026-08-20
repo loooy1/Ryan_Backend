@@ -1,4 +1,4 @@
-using GrcsBackend.Modules.Wcs.Automation.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Console.Services;
 using Microsoft.AspNetCore.SignalR;
 

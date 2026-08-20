@@ -1,6 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json;
-using GrcsBackend.Modules.Wcs.Automation.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 
 namespace GrcsBackend.Modules.Wcs.Proxy.Services;
 

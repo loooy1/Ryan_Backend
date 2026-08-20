@@ -1,9 +1,10 @@
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 using System.Text.Json;
-using GrcsBackend.Modules.Wcs.Automation.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure;
 using GrcsBackend.Modules.Wcs.Console.Services;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services;
+namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
 
 /// <summary>
 /// 自动化轮询执行服务（由前端 AutoRunService 平移而来，Skill E 核心）。

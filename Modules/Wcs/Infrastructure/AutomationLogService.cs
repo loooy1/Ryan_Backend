@@ -1,6 +1,6 @@
-using GrcsBackend.Modules.Wcs.Automation.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services;
+namespace GrcsBackend.Modules.Wcs.Infrastructure;
 
 /// <summary>
 /// 自动化/批量执行日志（内存环形缓冲，上限 500 条，带自增 Id）。

@@ -1,5 +1,5 @@
-using GrcsBackend.Modules.Wcs.Automation.Models;
-using GrcsBackend.Modules.Wcs.Automation.Services;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure;
 using Microsoft.AspNetCore.Mvc;
 
 namespace GrcsBackend.Modules.Wcs.Console.Controllers;

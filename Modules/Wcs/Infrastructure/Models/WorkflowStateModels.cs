@@ -1,4 +1,4 @@
-namespace GrcsBackend.Modules.Wcs.Automation.Models;
+namespace GrcsBackend.Modules.Wcs.Infrastructure.Models;
 
 /// <summary>信号确认状态行（workflow_state 表）。kind = arrival / removal / sent。</summary>
 public class WorkflowStateRow

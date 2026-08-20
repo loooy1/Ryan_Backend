@@ -1,7 +1,7 @@
 using System.Globalization;
 using GrcsBackend.Modules.Wcs.Console.Models;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Models;
+namespace GrcsBackend.Modules.Wcs.Infrastructure.Models;
 
 /// <summary>精简站点信息（与前端 MapStationLite 同构，从地图上传/GRCS 拉取后缓存）。</summary>
 public class MapStationLite

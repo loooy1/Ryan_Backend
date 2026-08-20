@@ -1,9 +1,10 @@
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 using System.Text.Json;
-using GrcsBackend.Modules.Wcs.Automation.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure.Models;
+using GrcsBackend.Modules.Wcs.Infrastructure;
 using GrcsBackend.Modules.Wcs.Console.Services;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services;
+namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
 
 /// <summary>
 /// 批量容器任务执行器（由前端 ContainerTaskService 平移而来）。
