@@ -93,6 +93,17 @@ public class LogEntryDto
     public string Color { get; set; } = "#94a3b8";
 }
 
+/// <summary>日志轮次（每轮下发一个标题，含该轮所有条目）。</summary>
+public class LogRoundDto
+{
+    public string RoundId { get; set; } = "";
+    public string ParentRoundId { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string StartTime { get; set; } = "";
+    public bool Completed { get; set; }
+    public List<LogEntryDto> Entries { get; set; } = new();
+}
+
 /// <summary>任务台账条目（与前端 TaskLedgerEntry 同构；ContainerCode 恒为托盘号、CargoCode 恒为货物号）。</summary>
 public class TaskLedgerEntry
 {

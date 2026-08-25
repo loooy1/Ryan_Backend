@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 
@@ -107,5 +108,29 @@ public class GrcsHttpClient
             return true;
         }
         catch { return false; }
+    }
+
+    /// <summary>通用转发：向任意 GRCS URL 发送原始 JSON 报文（功能模块/信号通用下发接口使用）。</summary>
+    public async Task<(bool Ok, int StatusCode, string Json)> ForwardAsync(string url, HttpMethod method, string? rawJson)
+    {
+        try
+        {
+            var client = NewClient();
+            HttpResponseMessage resp;
+            if (method == HttpMethod.Get)
+            {
+                resp = await client.GetAsync(url);
+            }
+            else
+            {
+                var content = new StringContent(rawJson ?? "{}", Encoding.UTF8, "application/json");
+                if (method == HttpMethod.Put) resp = await client.PutAsync(url, content);
+                else if (method == HttpMethod.Delete) resp = await client.DeleteAsync(url);
+                else resp = await client.PostAsync(url, content);
+            }
+            var body = await resp.Content.ReadAsStringAsync();
+            return (resp.IsSuccessStatusCode, (int)resp.StatusCode, body);
+        }
+        catch (Exception ex) { return (false, 0, JsonSerializer.Serialize(new { error = ex.Message })); }
     }
 }

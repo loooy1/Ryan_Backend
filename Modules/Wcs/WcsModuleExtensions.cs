@@ -25,23 +25,31 @@ public static class WcsModuleExtensions
         services.AddSingleton<StationLockStore>();
         services.AddSingleton<LedgerStore>();
         services.AddSingleton<SignalConfirmStore>();
+        services.AddSingleton<TaskTemplateStore>();
+        services.AddSingleton<FeatureModuleStore>();
+        services.AddSingleton<AutoTemplateStore>();
+        services.AddSingleton<MockRuleStore>();
+        services.AddSingleton<MockApprovalService>();
         services.AddSingleton<GrcsHttpClient>();
         // 轮询/批量互斥闸（多标签页也能保证只有一个在执行）
         services.AddSingleton<AutomationGate>();
 
-        // 自动化轮询服务：单例 + IHostedService 双注册（控制器可注入操纵）
-        services.AddSingleton<AutoRunHostedService>();
-        services.AddHostedService(sp => sp.GetRequiredService<AutoRunHostedService>());
-        // 批量容器执行器（非后台，仅控制器触发）
-        services.AddSingleton<ContainerTaskRunner>();
+        // 模块执行记录（内存环形缓冲，供「模块执行记录」面板增量拉取）
+        services.AddSingleton<ModuleExecLogStore>();
+        // 统一模块执行引擎：起点/起点之后在下发时、终点在 FINISHED 后，统一在后端执行
+        services.AddSingleton<ModuleRunService>();
+        // 终点模块后台执行器：订阅 TaskFinished，对非 Auto_ 任务跑终点模块（自动化任务由 AutoTemplateRunner 自行跑）
+        services.AddHostedService<FinishedModuleWatcher>();
+
+        // 自动化模板执行引擎：单例 + IHostedService 双注册（控制器可注入操纵）
+        services.AddSingleton<AutoTemplateRunner>();
+        services.AddHostedService(sp => sp.GetRequiredService<AutoTemplateRunner>());
         // 信号自动放行：宿主启动即常驻（后端唯一，取代前端 leader 模式）
         services.AddSingleton<SignalAutoHostedService>();
         services.AddHostedService(sp => sp.GetRequiredService<SignalAutoHostedService>());
 
-        // ── Console（控制台/阶段/出入申请/台账/地图）──
-        // 准入决策状态必须跨请求共享（GRCS 循环重发 + 管理接口查询），用 Singleton
-        services.AddSingleton<IAdmittanceService, AdmittanceService>();
-        // 任务阶段事件同样跨请求共享（GRCS 上报 + 前端轮询），用 Singleton
+        // ── Console（控制台/阶段/台账/地图）──
+        // 任务阶段事件跨请求共享（GRCS 上报 + 前端轮询），用 Singleton
         services.AddSingleton<ITaskStageService, TaskStageService>();
 
         return services;

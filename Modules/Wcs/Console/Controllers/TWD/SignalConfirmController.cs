@@ -7,7 +7,8 @@ namespace GrcsBackend.Modules.Wcs.Console.Controllers.TWD;
 /// 信号确认状态接口（/api/wcs/signal-confirm）：
 /// GET 全量（前端 1s 轮询跨标签页同步）；POST 抢占（claimed=true 才可发 WCS 信号，防多标签页重复发送）；
 /// DELETE 撤销（发送失败回滚 / 恢复）。
-/// kind 枚举：arrival / removal / sent。
+/// kind 枚举：arrival / removal / sent / module_after / module_end。
+/// （module_after = 任务模板「起点之后」模块执行抢占；module_end = 任务模板「终点」模块执行抢占。）
 /// </summary>
 [ApiController]
 [Route("api/wcs/signal-confirm")]
@@ -37,7 +38,7 @@ public class SignalConfirmController : ControllerBase
         return Ok(new { success = true, kind, taskId });
     }
 
-    private static bool ValidKind(string kind) => kind is "arrival" or "removal" or "sent";
+    private static bool ValidKind(string kind) => kind is "arrival" or "removal" or "sent" or "module_after" or "module_end";
 }
 
 public class ClaimBody

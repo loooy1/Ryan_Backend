@@ -174,6 +174,13 @@ public class StationLockStore
             _locks[station] = new StationLockEntry { TaskId = flowEndTaskId };
         }
     }
+
+    /// <summary>释放指定站点锁（任务 FINISHED 后由自动化引擎调用）。</summary>
+    public void Release(string station)
+    {
+        if (string.IsNullOrEmpty(station)) return;
+        lock (_lock) _locks.Remove(station);
+    }
 }
 
 /// <summary>任务台账壳（底层为 task_records 合并表创建行，上限 10000 条）。Singleton。</summary>

@@ -58,6 +58,42 @@ public class AutomationDb
                 time TEXT NOT NULL,
                 PRIMARY KEY (kind, task_id)
             );
+            -- 任务类型模板（前端任务下发页创建/维护；payload 存完整模板 JSON，跨浏览器共享）
+            CREATE TABLE IF NOT EXISTS task_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                value TEXT NOT NULL UNIQUE,
+                label TEXT NOT NULL,
+                description TEXT NOT NULL,
+                category TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- 功能模板（前端信号交互页创建/维护；payload 存完整模块 JSON，跨浏览器共享）
+            CREATE TABLE IF NOT EXISTS feature_modules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                module_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                api_url TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- 自动化模板（前端自动化页创建/维护；payload 存完整模板 JSON，跨浏览器共享）
+            CREATE TABLE IF NOT EXISTS auto_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                template_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- 通用 Mock 规则（前端可配任意入站 URL + 参数匹配 → 自定义返回值）
+            CREATE TABLE IF NOT EXISTS mock_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id TEXT NOT NULL UNIQUE,
+                method TEXT NOT NULL,
+                path_pattern TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """;
         cmd.ExecuteNonQuery();
     }
@@ -87,6 +123,15 @@ public class AutomationDb
         cmd.CommandText = "INSERT INTO kv(key, value) VALUES($k, $v) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
         cmd.Parameters.AddWithValue("$k", key);
         cmd.Parameters.AddWithValue("$v", value);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void KvRemove(string key)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM kv WHERE key = $k";
+        cmd.Parameters.AddWithValue("$k", key);
         cmd.ExecuteNonQuery();
     }
 
@@ -141,31 +186,6 @@ public class AutomationDb
         cmd.CommandText = "SELECT id, task_id, stage, time, warehouse, container_code, cargo_code, task_type, route_codes, station_code, ok, status_code FROM task_records ORDER BY id";
         using var reader = cmd.ExecuteReader();
         while (reader.Read()) list.Add(ReadTaskRecord(reader));
-        return list;
-    }
-
-    /// <summary>读创建行（stage=CREATED，投影为台账条目；id 倒序，最新在前）。</summary>
-    public List<Models.TaskLedgerEntry> TaskRecordGetCreated(int limit = 500)
-    {
-        var list = new List<Models.TaskLedgerEntry>();
-        using var conn = Open();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, task_id, stage, time, warehouse, container_code, cargo_code, task_type, route_codes, station_code, ok, status_code FROM task_records WHERE stage = 'CREATED' ORDER BY id DESC LIMIT $l";
-        cmd.Parameters.AddWithValue("$l", Math.Clamp(limit, 1, 10000));
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read()) list.Add(ReadTaskRecord(reader).ToLedgerEntry());
-        return list;
-    }
-
-    /// <summary>读阶段行（stage<>'CREATED'，投影为阶段事件；id 升序）。</summary>
-    public List<GrcsBackend.Modules.Wcs.Console.Models.StageChangeEvent> TaskRecordGetStages()
-    {
-        var list = new List<GrcsBackend.Modules.Wcs.Console.Models.StageChangeEvent>();
-        using var conn = Open();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, task_id, stage, time, warehouse, container_code, cargo_code, task_type, route_codes, station_code, ok, status_code FROM task_records WHERE stage <> 'CREATED' ORDER BY id";
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read()) list.Add(ReadTaskRecord(reader).ToStageEvent());
         return list;
     }
 
@@ -263,6 +283,252 @@ public class AutomationDb
             });
         }
         return list;
+    }
+
+    // ── Task Templates（任务类型模板，payload 存完整 JSON）──
+
+    /// <summary>全表读取（id 升序）。</summary>
+    public List<Models.TaskTemplateDto> TaskTemplateGetAll()
+    {
+        var list = new List<Models.TaskTemplateDto>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT value, label, description, category, payload FROM task_templates ORDER BY id";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var dto = Deserialize<Models.TaskTemplateDto>(reader.GetString(4));
+            if (dto == null) continue;
+            dto.Value = reader.GetString(0);
+            dto.Label = reader.GetString(1);
+            dto.Description = reader.GetString(2);
+            dto.Category = reader.GetString(3);
+            list.Add(dto);
+        }
+        return list;
+    }
+
+    /// <summary>整体替换（删除旧行后按序插入；Value 冲突时更新）。</summary>
+    public void TaskTemplateReplaceAll(IEnumerable<Models.TaskTemplateDto> items)
+    {
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using (var del = conn.CreateCommand())
+        {
+            del.CommandText = "DELETE FROM task_templates";
+            del.ExecuteNonQuery();
+        }
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item.Value)) continue;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO task_templates(value, label, description, category, payload, updated_at)
+                VALUES($v,$l,$d,$c,$p,$u)
+                ON CONFLICT(value) DO UPDATE SET label=excluded.label, description=excluded.description,
+                    category=excluded.category, payload=excluded.payload, updated_at=excluded.updated_at
+                """;
+            cmd.Parameters.AddWithValue("$v", item.Value);
+            cmd.Parameters.AddWithValue("$l", item.Label ?? "");
+            cmd.Parameters.AddWithValue("$d", item.Description ?? "");
+            cmd.Parameters.AddWithValue("$c", item.Category ?? "");
+            cmd.Parameters.AddWithValue("$p", System.Text.Json.JsonSerializer.Serialize(item));
+            cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    /// <summary>按 Value 删除一条任务模板。</summary>
+    public void TaskTemplateRemove(string value)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM task_templates WHERE value = $v";
+        cmd.Parameters.AddWithValue("$v", value);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ── Feature Modules（功能模板，payload 存完整 JSON）──
+
+    /// <summary>全表读取（id 升序）。</summary>
+    public List<Models.FeatureModuleDto> FeatureModuleGetAll()
+    {
+        var list = new List<Models.FeatureModuleDto>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT module_id, name, api_url, payload FROM feature_modules ORDER BY id";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var dto = Deserialize<Models.FeatureModuleDto>(reader.GetString(3));
+            if (dto == null) continue;
+            dto.Id = reader.GetString(0);
+            dto.Name = reader.GetString(1);
+            dto.ApiUrl = reader.GetString(2);
+            list.Add(dto);
+        }
+        return list;
+    }
+
+    /// <summary>整体替换（删除旧行后按序插入；module_id 冲突时更新）。</summary>
+    public void FeatureModuleReplaceAll(IEnumerable<Models.FeatureModuleDto> items)
+    {
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using (var del = conn.CreateCommand())
+        {
+            del.CommandText = "DELETE FROM feature_modules";
+            del.ExecuteNonQuery();
+        }
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item.Id)) continue;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO feature_modules(module_id, name, api_url, payload, updated_at)
+                VALUES($i,$n,$a,$p,$u)
+                ON CONFLICT(module_id) DO UPDATE SET name=excluded.name, api_url=excluded.api_url,
+                    payload=excluded.payload, updated_at=excluded.updated_at
+                """;
+            cmd.Parameters.AddWithValue("$i", item.Id);
+            cmd.Parameters.AddWithValue("$n", item.Name ?? "");
+            cmd.Parameters.AddWithValue("$a", item.ApiUrl ?? "");
+            cmd.Parameters.AddWithValue("$p", System.Text.Json.JsonSerializer.Serialize(item));
+            cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    /// <summary>按 module_id 删除一条功能模板。</summary>
+    public void FeatureModuleRemove(string moduleId)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM feature_modules WHERE module_id = $i";
+        cmd.Parameters.AddWithValue("$i", moduleId);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ── Auto Templates（自动化模板，payload 存完整 JSON）──
+
+    /// <summary>全表读取（id 升序）。</summary>
+    public List<Models.AutoTemplateDto> AutoTemplateGetAll()
+    {
+        var list = new List<Models.AutoTemplateDto>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT template_id, name, payload FROM auto_templates ORDER BY id";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var dto = Deserialize<Models.AutoTemplateDto>(reader.GetString(2));
+            if (dto == null) continue;
+            dto.Id = reader.GetString(0);
+            dto.Name = reader.GetString(1);
+            list.Add(dto);
+        }
+        return list;
+    }
+
+    /// <summary>整体替换（删除旧行后按序插入；template_id 冲突时更新）。</summary>
+    public void AutoTemplateReplaceAll(IEnumerable<Models.AutoTemplateDto> items)
+    {
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using (var del = conn.CreateCommand())
+        {
+            del.CommandText = "DELETE FROM auto_templates";
+            del.ExecuteNonQuery();
+        }
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item.Id)) continue;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO auto_templates(template_id, name, payload, updated_at)
+                VALUES($i,$n,$p,$u)
+                ON CONFLICT(template_id) DO UPDATE SET name=excluded.name,
+                    payload=excluded.payload, updated_at=excluded.updated_at
+                """;
+            cmd.Parameters.AddWithValue("$i", item.Id);
+            cmd.Parameters.AddWithValue("$n", item.Name ?? "");
+            cmd.Parameters.AddWithValue("$p", System.Text.Json.JsonSerializer.Serialize(item));
+            cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    /// <summary>按 template_id 删除一条自动化模板。</summary>
+    public void AutoTemplateRemove(string id)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM auto_templates WHERE template_id = $i";
+        cmd.Parameters.AddWithValue("$i", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ── Mock Rules（通用入站 Mock）──
+
+    public List<Models.MockRuleDto> MockRuleGetAll()
+    {
+        var list = new List<Models.MockRuleDto>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT rule_id, method, path_pattern, payload FROM mock_rules ORDER BY id";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var dto = Deserialize<Models.MockRuleDto>(reader.GetString(3));
+            if (dto == null) continue;
+            dto.Id = reader.GetString(0);
+            dto.Method = reader.GetString(1);
+            dto.PathPattern = reader.GetString(2);
+            list.Add(dto);
+        }
+        return list;
+    }
+
+    public void MockRuleReplaceAll(IEnumerable<Models.MockRuleDto> items)
+    {
+        using var conn = Open();
+        using var tx = conn.BeginTransaction();
+        using (var del = conn.CreateCommand()) { del.CommandText = "DELETE FROM mock_rules"; del.ExecuteNonQuery(); }
+        foreach (var item in items)
+        {
+            if (string.IsNullOrWhiteSpace(item.Id)) continue;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO mock_rules(rule_id, method, path_pattern, payload, updated_at)
+                VALUES($i,$m,$p,$l,$u)
+                ON CONFLICT(rule_id) DO UPDATE SET method=excluded.method, path_pattern=excluded.path_pattern, payload=excluded.payload, updated_at=excluded.updated_at
+                """;
+            cmd.Parameters.AddWithValue("$i", item.Id);
+            cmd.Parameters.AddWithValue("$m", item.Method ?? "POST");
+            cmd.Parameters.AddWithValue("$p", item.PathPattern ?? "");
+            cmd.Parameters.AddWithValue("$l", System.Text.Json.JsonSerializer.Serialize(item));
+            cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+            cmd.ExecuteNonQuery();
+        }
+        tx.Commit();
+    }
+
+    public void MockRuleRemove(string id)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM mock_rules WHERE rule_id = $i";
+        cmd.Parameters.AddWithValue("$i", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    private static T? Deserialize<T>(string json)
+    {
+        try { return System.Text.Json.JsonSerializer.Deserialize<T>(json); }
+        catch { return default; }
     }
 
     private static List<string> DeserializeCodes(string json)

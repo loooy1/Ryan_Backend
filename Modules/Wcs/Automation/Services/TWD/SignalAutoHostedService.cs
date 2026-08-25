@@ -26,7 +26,6 @@ public class SignalAutoHostedService : IHostedService
     private readonly object _lock = new();
     private CancellationTokenSource? _cts;
 
-    public bool AdmittanceAuto { get; private set; }
     public bool ArrivalAuto { get; private set; }
     public bool RemovalAuto { get; private set; }
     public bool AutoSend { get; private set; }
@@ -69,7 +68,6 @@ public class SignalAutoHostedService : IHostedService
         return Task.CompletedTask;
     }
 
-    public void SetAdmittance(bool on) { AdmittanceAuto = on; SaveFlags(); }
     public void SetArrival(bool on) { ArrivalAuto = on; SaveFlags(); }
     public void SetRemoval(bool on) { RemovalAuto = on; SaveFlags(); }
     public void SetSorting(bool on) { AutoSend = on; SaveFlags(); }
@@ -235,7 +233,6 @@ public class SignalAutoHostedService : IHostedService
     {
         try
         {
-            AdmittanceAuto = bool.TryParse(_db.KvGet("sig_admittance_auto"), out var x) && x;
             ArrivalAuto = bool.TryParse(_db.KvGet("sig_arrival_auto"), out var a) && a;
             RemovalAuto = bool.TryParse(_db.KvGet("sig_removal_auto"), out var r) && r;
             AutoSend = bool.TryParse(_db.KvGet("sig_ss_auto"), out var s) && s;
@@ -266,7 +263,6 @@ public class SignalAutoHostedService : IHostedService
     {
         try
         {
-            _db.KvSet("sig_admittance_auto", AdmittanceAuto.ToString().ToLowerInvariant());
             _db.KvSet("sig_arrival_auto", ArrivalAuto.ToString().ToLowerInvariant());
             _db.KvSet("sig_removal_auto", RemovalAuto.ToString().ToLowerInvariant());
             _db.KvSet("sig_ss_auto", AutoSend.ToString().ToLowerInvariant());

@@ -39,8 +39,17 @@ public interface ITaskStageService
     /// <summary>已到达 FINISHED 的任务号集合（大小写不敏感；自动化解锁/信号放行用）。</summary>
     HashSet<string> FinishedTaskIds { get; }
 
+    /// <summary>任务到达 FINISHED 时触发（参数 = taskId）；供后端模块执行器在终点阶段跑模块。</summary>
+    event Action<string>? TaskFinished;
+
     /// <summary>等待任务到达 FINISHED（进程内事件驱动，默认无限等待；传入 timeout 才会限时）。</summary>
     Task WaitFinishedAsync(string taskId, TimeSpan? timeout = null);
+
+    /// <summary>强制完成所有等待中的 FINISHED 等待器（用于强制结束）。</summary>
+    void ForceCompleteAll();
+
+    /// <summary>强制完成指定任务的 FINISHED 等待器。</summary>
+    void ForceComplete(string taskId);
 }
 
 public class TaskStageService : ITaskStageService
@@ -81,6 +90,8 @@ public class TaskStageService : ITaskStageService
     {
         get { lock (_lock) { return new HashSet<string>(_finished, StringComparer.OrdinalIgnoreCase); } }
     }
+
+    public event Action<string>? TaskFinished;
 
     /// <summary>写创建行（来自下发台账）：同一任务只保留一条 CREATED，重复写入跳过。</summary>
     public void RecordCreated(List<TaskLedgerEntry> entries)
@@ -138,6 +149,7 @@ public class TaskStageService : ITaskStageService
                     _finished.Clear(); // 防无限增长；重建由后续 FINISHED 事件补齐
                 if (_waiters.Remove(change.TaskId, out var tcs))
                     tcs.TrySetResult(true);
+                TaskFinished?.Invoke(change.TaskId);
             }
         }
         var newId = _db.TaskRecordInsert(rec);   // 持久化（锁外 IO）
@@ -225,6 +237,29 @@ public class TaskStageService : ITaskStageService
     /// 比前端方案（HTTP 轮询 task-stages）更快更准。注册等待器后由 Record 的 FINISHED 分支唤醒。
     /// 默认无限等待；显式传 timeout 才限时（超时抛 TimeoutException）。
     /// </summary>
+    public void ForceComplete(string taskId)
+    {
+        TaskCompletionSource<bool>? tcs = null;
+        lock (_lock)
+        {
+            _finished.Add(taskId);
+            if (_waiters.Remove(taskId, out tcs)) { }
+        }
+        tcs?.TrySetResult(true);
+    }
+
+    public void ForceCompleteAll()
+    {
+        List<(string taskId, TaskCompletionSource<bool> tcs)> pending;
+        lock (_lock)
+        {
+            pending = _waiters.Select(kv => (kv.Key, kv.Value)).ToList();
+            foreach (var (id, _) in pending) _finished.Add(id);
+            _waiters.Clear();
+        }
+        foreach (var (_, tcs) in pending) tcs.TrySetResult(true);
+    }
+
     public Task WaitFinishedAsync(string taskId, TimeSpan? timeout = null)
     {
         TaskCompletionSource<bool> tcs;

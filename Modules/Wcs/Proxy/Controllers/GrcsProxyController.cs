@@ -1,6 +1,8 @@
+using System.Text.Json;
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Infrastructure;
+using GrcsBackend.Modules.Wcs.Automation.Services.TWD;
 using Microsoft.AspNetCore.Mvc;
 
 namespace GrcsBackend.Modules.Wcs.Proxy.Controllers;
@@ -17,11 +19,23 @@ public class GrcsProxyController : ControllerBase
 {
     private readonly GrcsHttpClient _grcs;
     private readonly WcsSettingsService _settings;
+    private readonly ModuleRunService _moduleRun;
+    private readonly ILogger<GrcsProxyController> _logger;
 
-    public GrcsProxyController(GrcsHttpClient grcs, WcsSettingsService settings)
+    public GrcsProxyController(GrcsHttpClient grcs, WcsSettingsService settings, ModuleRunService moduleRun, ILogger<GrcsProxyController> logger)
     {
         _grcs = grcs;
         _settings = settings;
+        _moduleRun = moduleRun;
+        _logger = logger;
+    }
+
+    /// <summary>记录 WCS 前端实际提交的报文（排查用，含响应摘要）。</summary>
+    private void LogProxy(string endpoint, object payload, bool ok, int code, string json)
+    {
+        _logger.LogInformation(
+            "GRCS 代理 {Endpoint} 入站: {Payload} | 结果 ok={Ok} code={Code} 响应={Json}",
+            endpoint, JsonSerializer.Serialize(payload), ok, code, json);
     }
 
     private string BaseUrl => _settings.Get().GrcsBaseUrl;
@@ -33,6 +47,7 @@ public class GrcsProxyController : ControllerBase
     {
         payload.Warehouse = SceneName;
         var (ok, code, json) = await _grcs.SendTaskGroupAsync(BaseUrl, payload);
+        LogProxy("task-receive", payload, ok, code, json);
         return Ok(new { ok, code, json });
     }
 
@@ -42,6 +57,7 @@ public class GrcsProxyController : ControllerBase
     {
         payload.SceneName = SceneName;
         var (ok, code, json) = await _grcs.SendVehicleOrderAsync(BaseUrl, payload);
+        LogProxy("change-floor", payload, ok, code, json);
         return Ok(new { ok, code, json });
     }
 
@@ -63,33 +79,6 @@ public class GrcsProxyController : ControllerBase
         return Ok(new { ok, code, json });
     }
 
-    /// <summary>货物到达通知代理（GRCS /api/v1/container_ready）。</summary>
-    [HttpPost("container-ready")]
-    public async Task<ActionResult<object>> ContainerReady([FromBody] ContainerReadyDto req)
-    {
-        req.Warehouse = SceneName;
-        var (ok, code, json) = await _grcs.SendContainerReadyAsync(BaseUrl, req);
-        return Ok(new { ok, code, json });
-    }
-
-    /// <summary>货物移除通知代理（GRCS /api/v1/container_remove）。</summary>
-    [HttpPost("container-remove")]
-    public async Task<ActionResult<object>> ContainerRemove([FromBody] ContainerRemoveDto req)
-    {
-        req.Warehouse = SceneName;
-        var (ok, code, json) = await _grcs.SendContainerRemoveAsync(BaseUrl, req);
-        return Ok(new { ok, code, json });
-    }
-
-    /// <summary>分拣完成通知代理（GRCS /api/v1/container_operation_finish）。</summary>
-    [HttpPost("operation-finish")]
-    public async Task<ActionResult<object>> OperationFinish([FromBody] OperationFinishDto req)
-    {
-        req.Warehouse = SceneName;
-        var (ok, code, json) = await _grcs.SendOperationFinishAsync(BaseUrl, req);
-        return Ok(new { ok, code, json });
-    }
-
     /// <summary>地图 zip 下载代理（GRCS /api/Map/GetMap，场景按设置），成功返回字节流。</summary>
     [HttpGet("map")]
     public async Task<ActionResult> Map()
@@ -106,32 +95,23 @@ public class GrcsProxyController : ControllerBase
         var ok = await _grcs.PingAsync(BaseUrl);
         return Ok(new { ok });
     }
-}
 
-public class ContainerReadyDto
-{
-    public DateTime MsgTime { get; set; } = DateTime.Now;
-    public string Warehouse { get; set; } = "";
-    public string TaskId { get; set; } = "";
-    public string ContainerCode { get; set; } = "";
-    public string StationCode { get; set; } = "";
-}
-
-public class ContainerRemoveDto
-{
-    public DateTime MsgTime { get; set; } = DateTime.Now;
-    public string Warehouse { get; set; } = "";
-    public string ContainerCode { get; set; } = "";
-    public string StationCode { get; set; } = "";
-}
-
-public class OperationFinishDto
-{
-    public DateTime MsgTime { get; set; } = DateTime.Now;
-    public string Warehouse { get; set; } = "";
-    public string TaskId { get; set; } = "";
-    public string ContainerCode { get; set; } = "";
-    public bool RemoveContainer { get; set; }
-    public string StationCode { get; set; } = "";
-    public string AreaCode { get; set; } = "";
+    /// <summary>
+    /// 任务组下发（含三类模块后端执行）：POST /api/wcs/task/send。
+    /// 入参 WcsTaskGroup（前端只组单任务组），后端经 ModuleRunService 统一跑
+    /// 起点模块(下发前) → 下发 GRCS /api/v1/task_receive → 起点之后模块(下发成功后)；
+    /// 终点模块由 FinishedModuleWatcher 在任务 FINISHED 后自动执行（框架统一）。
+    /// 响应只回显下发结果 { ok, code, json }，模块明细在「模块执行记录」面板看。
+    /// </summary>
+    [HttpPost("task/send")]
+    [Route("/api/wcs/task/send")]
+    public async Task<ActionResult<object>> TaskSend([FromBody] WcsTaskGroup payload)
+    {
+        if (payload == null || payload.Tasks == null || payload.Tasks.Count == 0)
+            return Ok(new { ok = false, code = 0, json = "任务组为空" });
+        payload.Warehouse = SceneName;
+        var (ok, code, json) = await _moduleRun.SendTaskWithModulesAsync(payload);
+        LogProxy("task/send", payload, ok, code, json);
+        return Ok(new { ok, code, json });
+    }
 }

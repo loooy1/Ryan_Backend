@@ -13,37 +13,22 @@ namespace GrcsBackend.Modules.Wcs.Console.Controllers;
 [Route("api/wcs")]
 public class WcsConsoleController : ControllerBase
 {
-    private readonly IAdmittanceService _admittance;
     private readonly ITaskStageService _stages;
     private readonly SignalAutoHostedService _signals;
+    private readonly MockApprovalService _mockApproval;
 
-    public WcsConsoleController(IAdmittanceService admittance, ITaskStageService stages, SignalAutoHostedService signals)
+    public WcsConsoleController(ITaskStageService stages, SignalAutoHostedService signals, MockApprovalService mockApproval)
     {
-        _admittance = admittance;
         _stages = stages;
         _signals = signals;
+        _mockApproval = mockApproval;
     }
 
     /// <summary>当前状态：是否自动模式 + 待确认数（自动模式读统一信号源 SignalAutoHostedService）。</summary>
     [HttpGet("status")]
     public ActionResult<object> Status()
     {
-        return Ok(new { autoMode = _signals.AdmittanceAuto, pendingCount = _admittance.PendingCount });
-    }
-
-    /// <summary>进入申请事件列表（前端轮询，按时间正序）。</summary>
-    [HttpGet("events")]
-    public ActionResult<List<EntryRequestEvent>> Events()
-    {
-        return Ok(_admittance.GetEvents());
-    }
-
-    /// <summary>批准/拒绝一个进入申请（key 为 VehicleCode@StationCode）。</summary>
-    [HttpPost("decisions/{key}")]
-    public ActionResult<object> Decide(string key, [FromBody] DecisionRequest request)
-    {
-        _admittance.Decide(key, request.Allow);
-        return Ok(new { success = true, key, allow = request.Allow });
+        return Ok(new { pendingCount = _mockApproval.PendingCount });
     }
 
     /// <summary>删除指定任务的全部记录（创建行 + 阶段事件，task_records 全行）。</summary>
@@ -54,19 +39,34 @@ public class WcsConsoleController : ControllerBase
         return Ok(new { success = true, taskId });
     }
 
-    /// <summary>删除单个进入申请事件。</summary>
-    [HttpDelete("events/{key}")]
-    public ActionResult<object> DeleteEvent(string key)
+    /// <summary>通用 Mock 审批事件列表（任意 URL 且 RequiresApproval=true 时生成）。</summary>
+    [HttpGet("mock-approvals")]
+    public ActionResult<List<MockApprovalService.MockRequestEvent>> MockApprovals() => Ok(_mockApproval.GetEvents());
+
+    [HttpPost("mock-approvals/decisions/{key}")]
+    public ActionResult<object> DecideMock(string key, [FromBody] DecisionRequest request)
     {
-        _admittance.RemoveEvent(key);
+        _mockApproval.Decide(key, request.Allow);
+        return Ok(new { success = true, key, allow = request.Allow });
+    }
+
+    [HttpDelete("mock-approvals/{key}")]
+    public ActionResult<object> DeleteMockApproval(string key)
+    {
+        _mockApproval.RemoveEvent(key);
         return Ok(new { success = true, key });
     }
 
-    /// <summary>清空全部进入申请事件。</summary>
-    [HttpDelete("events")]
-    public ActionResult<object> ClearEvents()
+    [HttpDelete("mock-approvals")]
+    public ActionResult<object> ClearMockApprovals()
     {
-        _admittance.ClearAllEvents();
+        _mockApproval.ClearAll();
         return Ok(new { success = true });
     }
+}
+
+/// <summary>批准/拒绝请求体（准入 + 通用 Mock 审批共用）。</summary>
+public class DecisionRequest
+{
+    public bool Allow { get; set; }
 }
