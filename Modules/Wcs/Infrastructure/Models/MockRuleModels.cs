@@ -17,6 +17,8 @@ public class MockMatcher
 public class MockRuleDto
 {
     public string Id { get; set; } = "";
+    /// <summary>名称（用于列表/记录检索显示；可空）。</summary>
+    public string Name { get; set; } = "";
     public string Method { get; set; } = "POST";
     /// <summary>路径匹配，支持 * 通配，如 /api/v1/station_entry_request 或 /api/mock/*。</summary>
     public string PathPattern { get; set; } = "";

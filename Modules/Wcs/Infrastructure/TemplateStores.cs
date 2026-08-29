@@ -121,6 +121,18 @@ public class AutoTemplateStore
         }
     }
 
+    /// <summary>单条保存：替换内存中同 Id 项（不存在则追加）并持久化，不影响其他模板。</summary>
+    public void Upsert(AutoTemplateDto item)
+    {
+        if (string.IsNullOrWhiteSpace(item.Id)) return;
+        lock (_lock)
+        {
+            var idx = _items.FindIndex(x => string.Equals(x.Id, item.Id, StringComparison.OrdinalIgnoreCase));
+            if (idx >= 0) _items[idx] = item; else _items.Add(item);
+            _db.AutoTemplateUpsert(item);
+        }
+    }
+
     public bool Remove(string id)
     {
         lock (_lock)

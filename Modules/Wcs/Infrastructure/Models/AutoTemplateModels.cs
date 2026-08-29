@@ -25,8 +25,15 @@ public class AutoStepDto
     public string Label { get; set; } = "";
 
     /// <summary>RunTemplate 专用：容器是否使用前置步骤挑选的托盘/货物号。
-    /// true（默认）：容器取自前置「选托盘/选货物」；false：容器按模板 ContainerPrefix 自动生成。</summary>
+    /// true（默认）：容器取自前置「选托盘/选货物」；false：容器按模板 ContainerPrefix 自动生成。
+    /// 旧模板字段（PickedStepIndex 未设置时生效）；新版请用 PickedStepIndex 精确指定引用步骤。</summary>
     public bool UsePickedContainer { get; set; } = true;
+
+    /// <summary>RunTemplate 专用：容器来源。
+    /// 0 = 按模板 ContainerPrefix 自动生成；-1 = 最近前置挑选的容器（旧逻辑）；
+    /// &gt;0 = 引用前置第 N 步挑选的容器号（选托盘=托盘号、选货物=货物号、RunTemplate=该步最终容器号）。
+    /// 未设置（0）且 UsePickedContainer=true 的旧数据按 -1 处理。</summary>
+    public int PickedStepIndex { get; set; } = 0;
 
     /// <summary>RunTemplate 专用：起点是否取自前置步骤的终点（链路衔接）。
     /// true（默认）：起点 = 上一步的终点（选托盘时即托盘所在站）；false：起点按模板 Start.StationTypeBits 在选点范围内自行选点。</summary>

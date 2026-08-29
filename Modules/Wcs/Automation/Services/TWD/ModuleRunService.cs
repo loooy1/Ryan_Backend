@@ -151,6 +151,37 @@ public class ModuleRunService
         }
     }
 
+    /// <summary>
+    /// 重试单条模块执行记录（前端「模块执行记录」→ 重试按钮）：用任务创建行恢复上下文，
+    /// 按记录中的模块名找到模块配置后重新 POST（MsgTime 等 Now 参数用当前时间），新记录经 SignalR 实时推送。
+    /// </summary>
+    public async Task RetryEntryAsync(ModuleExecLogEntry entry)
+    {
+        var ctx = BuildCtxFromRecord(entry.TaskId);
+        if (ctx == null)
+        {
+            _execLog.Add(entry.TaskId, entry.Point, entry.Module, false, 0, "任务上下文不存在（创建行缺失），无法重试");
+            return;
+        }
+        var mod = _modules.GetAll().FirstOrDefault(m => string.Equals(m.Name, entry.Module, StringComparison.OrdinalIgnoreCase));
+        if (mod == null)
+        {
+            _execLog.Add(entry.TaskId, entry.Point, entry.Module, false, 0, "模块未找到，无法重试");
+            return;
+        }
+        if (string.IsNullOrWhiteSpace(mod.ApiUrl))
+        {
+            _execLog.Add(entry.TaskId, entry.Point, entry.Module, false, 0, "API 地址为空，已跳过");
+            return;
+        }
+        var body = new Dictionary<string, object?>();
+        foreach (var p in mod.Params) body[p.Name] = ResolveSource(p, ctx);
+        var url = (_settings.Get()?.GrcsBaseUrl ?? "").TrimEnd('/') + mod.ApiUrl;
+        var (ok, code, json) = await _grcs.ForwardAsync(url, HttpMethod.Post, JsonSerializer.Serialize(body));
+        _execLog.Add(entry.TaskId, entry.Point, mod.Name, ok, code, json);
+        _logger.LogInformation("[Module] 重试 {TaskId} {Point} {Module}: {Ok} {Code} {Json}", entry.TaskId, entry.Point, mod.Name, ok, code, json.Length > 200 ? json[..200] : json);
+    }
+
     private static ModuleCtx? BuildCtxFromGroup(WcsTaskGroup group, WcsTaskItem task) => new()
     {
         Start = task.StationCode.FirstOrDefault() ?? "",

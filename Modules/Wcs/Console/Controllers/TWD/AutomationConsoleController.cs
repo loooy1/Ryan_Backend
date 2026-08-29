@@ -23,14 +23,13 @@ public class AutomationConsoleController : ControllerBase
     private readonly RangeConfigService _rangeConfig;
     private readonly WcsSettingsService _settings;
     private readonly SignalAutoHostedService _signals;
-    private readonly AutomationGate _gate;
-    private readonly GrcsHttpClient _grcs;
-    /// <summary>本轮纯移动任务下发成功数 / 失败数（系统日志实时计数用，开始/停止时归零）。</summary>
-    private int _moveOkCount;
-    private int _moveFailCount;
+    private readonly MoveLoopRunner _moveLoop;
+    private readonly NestRunner _nest;
+    private readonly NestConfigService _nestConfig;
 
     public AutomationConsoleController(AutoTemplateRunner auto, AutoTemplateStore templates, AutomationLogService logs,
-        RangeConfigService rangeConfig, WcsSettingsService settings, SignalAutoHostedService signals, AutomationGate gate, GrcsHttpClient grcs)
+        RangeConfigService rangeConfig, WcsSettingsService settings, SignalAutoHostedService signals,
+        MoveLoopRunner moveLoop, NestRunner nest, NestConfigService nestConfig)
     {
         _auto = auto;
         _templates = templates;
@@ -38,16 +37,16 @@ public class AutomationConsoleController : ControllerBase
         _rangeConfig = rangeConfig;
         _settings = settings;
         _signals = signals;
-        _gate = gate;
-        _grcs = grcs;
+        _moveLoop = moveLoop;
+        _nest = nest;
+        _nestConfig = nestConfig;
     }
 
-    /// <summary>库存分类汇总（纯空托 / 带货托 / 纯货物 / 锁定中），按「以前逻辑」在后端统计。</summary>
+    /// <summary>库存分类汇总 + 明细（纯空托 / 带货托 / 纯货物 / 锁定中=移动单元数），按「以前逻辑」在后端统计。</summary>
     [HttpGet("inventory-summary")]
     public async Task<ActionResult<object>> InventorySummary()
     {
-        var (empty, loaded, cargo, locked) = await _auto.GetInventorySummaryAsync();
-        return Ok(new { empty, loaded, cargo, locked });
+        return Ok(await _auto.GetInventorySummaryAsync());
     }
 
     /// <summary>整体状态快照（前端 2s 轮询）。dispatchActive=任一下发模式进行中（前端跨标签页警示/禁用判断）。</summary>
@@ -65,11 +64,16 @@ public class AutomationConsoleController : ControllerBase
             executed = tpl.Executed,
             status = tpl.Status,
             dispatchActive = tpl.AnyRunning,
-            moveRunning = _gate.MoveRunning,
-            moveTabId = _gate.MoveTabId,
+            moveRunning = _moveLoop.Running,
+            moveTabId = _moveLoop.TabId,
+            moveTotal = _moveLoop.Total,
+            moveOk = _moveLoop.Ok,
+            moveFail = _moveLoop.Fail,
+            moveLastError = _moveLoop.LastError,
             templates = _templates.GetAll(),
             settings = _settings.Get(),
             signals = new { arrivalAuto = _signals.ArrivalAuto, removalAuto = _signals.RemovalAuto, autoSend = _signals.AutoSend },
+            nestRunning = _nest.Running,
         });
     }
 
@@ -126,6 +130,19 @@ public class AutomationConsoleController : ControllerBase
         return Ok(new { success = true, count = _templates.GetAll().Count });
     }
 
+    /// <summary>单条保存（新建或更新），只动当前模板，不影响其他行。</summary>
+    [HttpPut("templates/{id}")]
+    public ActionResult<object> SaveTemplate([FromRoute] string id, [FromBody] AutoTemplateDto item)
+    {
+        if (item == null) return BadRequest(new { success = false, errors = new[] { "模板内容为空" } });
+        item.Id = id;
+        var errors = _auto.ValidateTemplates([item]);
+        if (errors.Count > 0)
+            return BadRequest(new { success = false, errors });
+        _templates.Upsert(item);
+        return Ok(new { success = true, count = _templates.GetAll().Count });
+    }
+
     [HttpDelete("templates")]
     public ActionResult<object> DeleteTemplate([FromQuery] string id)
     {
@@ -163,66 +180,21 @@ public class AutomationConsoleController : ControllerBase
         return Ok(new { success = true });
     }
 
-    /// <summary>移动任务循环登记租约：未启用（无任何下发进行中）则取用并置为启用，否则拒绝其他标签页。</summary>
+    /// <summary>纯移动任务循环启动：前端只通知「开启」，循环/选点/统计/日志全在 MoveLoopRunner（后端）。
+    /// 互斥（模板轮询/其他标签页）由 AutomationGate 判定。</summary>
     [HttpPost("move/start")]
-    public ActionResult<object> MoveStart([FromBody] TabRequest req)
+    public ActionResult<object> MoveStart([FromBody] StartMoveReq req)
     {
-        if (string.IsNullOrWhiteSpace(req.TabId)) return Ok(new { success = false, reason = "缺少 tabId" });
-        var (ok, reason) = _gate.TryStartMove(req.TabId);
-        if (!ok) _logs.Add("❌ 移动任务循环被拒绝：" + reason, "#f87171");
-        else
-        {
-            _moveOkCount = 0;
-            _moveFailCount = 0;
-            _logs.Add("▶ 纯移动任务循环开始（自动下发 MOVE_ONLY，日志实时更新计数）", "#60a5fa");
-        }
+        var (ok, reason) = _moveLoop.Start(req ?? new StartMoveReq());
         return Ok(new { success = ok, reason });
     }
 
-    /// <summary>移动任务循环属主心跳续约（防属主标签页关闭后租约永久占用）。</summary>
-    [HttpPost("move/beat")]
-    public ActionResult<object> MoveBeat([FromBody] TabRequest req)
-    {
-        if (string.IsNullOrWhiteSpace(req.TabId)) return Ok(new { success = false });
-        return Ok(new { success = _gate.BeatMove(req.TabId) });
-    }
-
-    /// <summary>移动任务循环释放租约（停止时调用）。</summary>
+    /// <summary>纯移动任务循环停止：取消循环、写汇总日志、释放互斥。</summary>
     [HttpPost("move/stop")]
     public ActionResult<object> MoveStop([FromBody] TabRequest req)
     {
-        var total = _moveOkCount + _moveFailCount;
-        _logs.Add($"⏹ 纯移动任务循环已停止（共下发 {total} 个任务：成功 {_moveOkCount} / 失败 {_moveFailCount}）", "#fbbf24");
-        _moveOkCount = 0;
-        _moveFailCount = 0;
-        if (!string.IsNullOrWhiteSpace(req.TabId)) _gate.StopMove(req.TabId);
+        _moveLoop.Stop(req?.TabId);
         return Ok(new { success = true });
-    }
-
-    /// <summary>单条纯移动任务下发：WCS 前端 → 本接口 → GRCS /api/RawOrder/ChangeFloor。
-    /// GRCS 地址与场景名从设置取（地图信息页保存）。成功/失败写入系统通知（同 key 合并，实时刷新计数）。</summary>
-    [HttpPost("move/dispatch")]
-    public async Task<ActionResult<object>> MoveDispatch([FromBody] VehicleOrderRequest order)
-    {
-        if (string.IsNullOrWhiteSpace(order?.OrderId)) return Ok(new { success = false, code = 0, json = "缺少订单 OrderId" });
-        order.SceneName = _settings.Get().SceneName;
-        var station = order.StationCodes?.FirstOrDefault() ?? "";
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        var (ok, code, json) = await _grcs.SendVehicleOrderAsync(_settings.Get().GrcsBaseUrl, order);
-        sw.Stop();
-        var elapsedMs = sw.ElapsedMilliseconds;
-        var bodyJson = JsonSerializer.Serialize(order, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
-        if (ok)
-        {
-            Interlocked.Increment(ref _moveOkCount);
-            _logs.AddOrUpdate("[纯移动·成功]", $"纯移动任务：下发成功，目的地: {station} ✓ 任务号：（{order.OrderId}）（耗时 {elapsedMs}ms）\n请求体: {bodyJson}", "#4ade80");
-        }
-        else
-        {
-            Interlocked.Increment(ref _moveFailCount);
-            _logs.AddOrUpdate("[纯移动·失败]", $"纯移动任务：下发失败 HTTP {code} · {station}（{order.OrderId}）（耗时 {elapsedMs}ms），等待下轮重试\n请求体: {bodyJson}\nGRCS 响应: {json}", "#f87171");
-        }
-        return Ok(new { success = ok, code, json, elapsedMs });
     }
 
     /// <summary>信号自动开关（进入申请/到达/移除/分拣四档，字段可缺省：只改传了的档）。</summary>
@@ -234,6 +206,29 @@ public class AutomationConsoleController : ControllerBase
         if (req.AutoSend.HasValue) _signals.SetSorting(req.AutoSend.Value);
         return Ok(new { success = true });
     }
+
+    // ── 归巢模式（查询就绪车 → 巢点附近普通路点 → 逐台 MOVE_ONLY 指定车下发）──
+
+    [HttpGet("nest/config")]
+    public ActionResult<NestConfigDto> NestConfig() => Ok(_nestConfig.Get());
+
+    [HttpPut("nest/config")]
+    public ActionResult<object> SaveNestConfig([FromBody] NestConfigDto config)
+    {
+        _nestConfig.Set(config ?? new NestConfigDto());
+        return Ok(new { success = true });
+    }
+
+    /// <summary>执行一次归巢（后台异步批量下发，运行中重复调用被忽略）。</summary>
+    [HttpPost("nest/run")]
+    public ActionResult<object> NestRun()
+    {
+        var (ok, reason) = _nest.Run();
+        return Ok(new { success = ok, reason });
+    }
+
+    [HttpGet("nest/status")]
+    public ActionResult<NestStatsDto> NestStatus() => Ok(_nest.Snapshot());
 }
 
 public class IntervalRequest { public int Interval { get; set; } } // 秒

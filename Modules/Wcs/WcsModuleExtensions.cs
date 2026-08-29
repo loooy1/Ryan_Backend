@@ -25,14 +25,23 @@ public static class WcsModuleExtensions
         services.AddSingleton<StationLockStore>();
         services.AddSingleton<LedgerStore>();
         services.AddSingleton<SignalConfirmStore>();
+        services.AddSingleton<ExceptionRecordStore>();
         services.AddSingleton<TaskTemplateStore>();
         services.AddSingleton<FeatureModuleStore>();
         services.AddSingleton<AutoTemplateStore>();
         services.AddSingleton<MockRuleStore>();
         services.AddSingleton<MockApprovalService>();
         services.AddSingleton<GrcsHttpClient>();
+        // GRCS 库存后台轮询缓存（2 秒刷新，自动化选点/库存统计共用；任务完成后可即时强制刷新）
+        services.AddSingleton<GrcsInventoryCacheService>();
+        services.AddHostedService(sp => sp.GetRequiredService<GrcsInventoryCacheService>());
         // 轮询/批量互斥闸（多标签页也能保证只有一个在执行）
         services.AddSingleton<AutomationGate>();
+        // 纯移动任务循环（后端执行：选点/下发/统计/日志，SignalR 广播 MoveTaskStats）
+        services.AddSingleton<MoveLoopRunner>();
+        // 归巢模式（一次性批量下发：查车/选点/指定车 MOVE_ONLY，SignalR 广播 NestStats）
+        services.AddSingleton<NestConfigService>();
+        services.AddSingleton<NestRunner>();
 
         // 模块执行记录（内存环形缓冲，供「模块执行记录」面板增量拉取）
         services.AddSingleton<ModuleExecLogStore>();

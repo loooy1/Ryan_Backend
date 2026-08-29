@@ -94,8 +94,86 @@ public class AutomationDb
                 payload TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            -- 异常记录（AGV/软件异常台账；纯 HTTP 读写，无轮询）
+            CREATE TABLE IF NOT EXISTS exception_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                happened_at TEXT NOT NULL,
+                vehicle_code TEXT,
+                phenomenon TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                responsible_dept TEXT NOT NULL DEFAULT '',
+                resolved INTEGER NOT NULL DEFAULT 0,
+                reproduced_at TEXT,
+                reproduce_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- 请求信号记录（通用 Mock 命中事件：需审批 + 自动通过；内存 + SQLite 持久化，重启不丢）
+            CREATE TABLE IF NOT EXISTS mock_request_events (
+                event_id INTEGER NOT NULL DEFAULT 0,
+                event_key TEXT PRIMARY KEY,
+                path_pattern TEXT NOT NULL,
+                method TEXT NOT NULL,
+                body_json TEXT NOT NULL,
+                query_string TEXT NOT NULL,
+                time TEXT NOT NULL,
+                decided_at TEXT,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                mock_rule_id TEXT NOT NULL,
+                mock_rule_desc TEXT NOT NULL,
+                rule_json TEXT NOT NULL
+            );
+            -- 模块执行记录（内存环形缓冲 + SQLite 持久化，重启不丢）
+            CREATE TABLE IF NOT EXISTS module_exec_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                point TEXT NOT NULL,
+                module TEXT NOT NULL,
+                ok INTEGER NOT NULL,
+                http_code INTEGER NOT NULL,
+                detail TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_mel_id ON module_exec_logs(id);
             """;
         cmd.ExecuteNonQuery();
+
+        // 迁移：老库补 vehicle_code 列
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('exception_records') WHERE name='vehicle_code'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE exception_records ADD COLUMN vehicle_code TEXT";
+                alter.ExecuteNonQuery();
+            }
+        }
+
+        // 迁移：老库补 responsible_dept 列（必填，默认空串）
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('exception_records') WHERE name='responsible_dept'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE exception_records ADD COLUMN responsible_dept TEXT NOT NULL DEFAULT ''";
+                alter.ExecuteNonQuery();
+            }
+        }
+
+        // 迁移：老库 mock_request_events 补 event_id 列（旧建表语句漏列）
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('mock_request_events') WHERE name='event_id'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE mock_request_events ADD COLUMN event_id INTEGER NOT NULL DEFAULT 0";
+                alter.ExecuteNonQuery();
+            }
+        }
     }
 
     public SqliteConnection Open()
@@ -461,6 +539,25 @@ public class AutomationDb
         tx.Commit();
     }
 
+    /// <summary>按 template_id 单条插入/更新一条自动化模板（不动其他行）。</summary>
+    public void AutoTemplateUpsert(Models.AutoTemplateDto item)
+    {
+        if (string.IsNullOrWhiteSpace(item.Id)) return;
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO auto_templates(template_id, name, payload, updated_at)
+            VALUES($i,$n,$p,$u)
+            ON CONFLICT(template_id) DO UPDATE SET name=excluded.name,
+                payload=excluded.payload, updated_at=excluded.updated_at
+            """;
+        cmd.Parameters.AddWithValue("$i", item.Id);
+        cmd.Parameters.AddWithValue("$n", item.Name ?? "");
+        cmd.Parameters.AddWithValue("$p", System.Text.Json.JsonSerializer.Serialize(item));
+        cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
     /// <summary>按 template_id 删除一条自动化模板。</summary>
     public void AutoTemplateRemove(string id)
     {
@@ -535,5 +632,324 @@ public class AutomationDb
     {
         try { return System.Text.Json.JsonSerializer.Deserialize<List<string>>(json) ?? []; }
         catch { return []; }
+    }
+
+    // ── Exception Records（异常记录台账：AGV/软件异常）──
+
+/// <summary>新增一条异常记录，返回自增 Id。</summary>
+    public long ExceptionRecordInsert(Models.ExceptionRecordDto rec)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO exception_records(happened_at, vehicle_code, phenomenon, reason, responsible_dept, resolved, reproduced_at, reproduce_count, created_at, updated_at)
+            VALUES($h,$vc,$ph,$r,$d,$rv,$rp,$rc,$c,$u)
+            """;
+        cmd.Parameters.AddWithValue("$h", rec.HappenedAt);
+        cmd.Parameters.AddWithValue("$vc", (object?)rec.VehicleCode ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ph", rec.Phenomenon ?? "");
+        cmd.Parameters.AddWithValue("$r", rec.Reason ?? "");
+        cmd.Parameters.AddWithValue("$d", rec.ResponsibleDept ?? "");
+        cmd.Parameters.AddWithValue("$rv", rec.Resolved ? 1 : 0);
+        cmd.Parameters.AddWithValue("$rp", (object?)rec.ReproducedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$rc", rec.ReproduceCount);
+        cmd.Parameters.AddWithValue("$c", DateTime.Now.ToString("O"));
+        cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+        cmd.ExecuteNonQuery();
+        using var idc = conn.CreateCommand();
+        idc.CommandText = "SELECT last_insert_rowid()";
+        return Convert.ToInt64(idc.ExecuteScalar());
+    }
+
+    /// <summary>全表读取（发生时间倒序，最新在前），支持按车号/发生日期范围/是否解决/责任部门过滤。</summary>
+    public List<Models.ExceptionRecordDto> ExceptionRecordGetAll(string? vehicle = null, string? dateFrom = null, string? dateTo = null, bool? resolved = null, string? dept = null)
+    {
+        var list = new List<Models.ExceptionRecordDto>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        var sql = "SELECT id, happened_at, vehicle_code, phenomenon, reason, responsible_dept, resolved, reproduced_at, reproduce_count FROM exception_records";
+        var conds = new List<string>();
+        if (!string.IsNullOrWhiteSpace(vehicle))
+        {
+            conds.Add("(vehicle_code IS NOT NULL AND vehicle_code LIKE '%' || $vc || '%')");
+            cmd.Parameters.AddWithValue("$vc", vehicle.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(dateFrom))
+        {
+            var df = dateFrom.Trim();
+            if (df.Length == 10) df += " 00:00:00";
+            conds.Add("happened_at >= $df");
+            cmd.Parameters.AddWithValue("$df", df);
+        }
+        if (!string.IsNullOrWhiteSpace(dateTo))
+        {
+            var dt = dateTo.Trim();
+            if (dt.Length == 10) dt += " 23:59:59";
+            conds.Add("happened_at <= $dt");
+            cmd.Parameters.AddWithValue("$dt", dt);
+        }
+        if (resolved.HasValue)
+        {
+            conds.Add("resolved = $rv");
+            cmd.Parameters.AddWithValue("$rv", resolved.Value ? 1 : 0);
+        }
+        if (!string.IsNullOrWhiteSpace(dept))
+        {
+            conds.Add("responsible_dept = $d");
+            cmd.Parameters.AddWithValue("$d", dept.Trim());
+        }
+        if (conds.Count > 0) sql += " WHERE " + string.Join(" AND ", conds);
+        sql += " ORDER BY happened_at DESC, id DESC";
+        cmd.CommandText = sql;
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            list.Add(new Models.ExceptionRecordDto
+            {
+                Id = reader.GetInt64(0),
+                HappenedAt = reader.GetString(1),
+                VehicleCode = reader.IsDBNull(2) ? null : reader.GetString(2),
+                Phenomenon = reader.GetString(3),
+                Reason = reader.GetString(4),
+                ResponsibleDept = reader.GetString(5),
+                Resolved = reader.GetInt32(6) != 0,
+                ReproducedAt = reader.IsDBNull(7) ? null : reader.GetString(7),
+                ReproduceCount = reader.GetInt32(8),
+            });
+        }
+        return list;
+    }
+
+    /// <summary>更新一条记录（现象/原因/责任部门/是否解决/复现时间/复现次数）。</summary>
+    public void ExceptionRecordUpdate(Models.ExceptionRecordDto rec)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE exception_records
+            SET happened_at=$h, vehicle_code=$vc, phenomenon=$ph, reason=$r, responsible_dept=$d, resolved=$rv, reproduced_at=$rp, reproduce_count=$rc, updated_at=$u
+            WHERE id=$id
+            """;
+        cmd.Parameters.AddWithValue("$id", rec.Id);
+        cmd.Parameters.AddWithValue("$h", rec.HappenedAt);
+        cmd.Parameters.AddWithValue("$vc", (object?)rec.VehicleCode ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$ph", rec.Phenomenon ?? "");
+        cmd.Parameters.AddWithValue("$r", rec.Reason ?? "");
+        cmd.Parameters.AddWithValue("$d", rec.ResponsibleDept ?? "");
+        cmd.Parameters.AddWithValue("$rv", rec.Resolved ? 1 : 0);
+        cmd.Parameters.AddWithValue("$rp", (object?)rec.ReproducedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$rc", rec.ReproduceCount);
+        cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>
+/// 复现三联动：复现次数 +1、复现时间=当前、自动置为未解决。
+/// vehicleCode 追加进车号历史（逗号分隔去重；空/null 不追加），不清空原历史。
+/// </summary>
+    public void ExceptionRecordReproduce(long id, string? vehicleCode)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE exception_records
+            SET reproduce_count = reproduce_count + 1, reproduced_at=$rp, resolved=0, updated_at=$u,
+                vehicle_code = CASE
+                    WHEN $vc IS NULL OR $vc = '' THEN vehicle_code
+                    WHEN vehicle_code IS NULL THEN $vc
+                    WHEN ',' || vehicle_code || ',' LIKE '%,' || $vc || ',%' THEN vehicle_code
+                    ELSE vehicle_code || ',' || $vc
+                END
+            WHERE id=$id
+            """;
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.Parameters.AddWithValue("$vc", string.IsNullOrWhiteSpace(vehicleCode) ? DBNull.Value : vehicleCode.Trim());
+        cmd.Parameters.AddWithValue("$rp", DateTime.Now.ToString("O"));
+        cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>删除一条记录。</summary>
+    public void ExceptionRecordRemove(long id)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM exception_records WHERE id = $id";
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ── 请求信号事件（mock_request_events 表，内存 + SQLite）──
+
+    /// <summary>全量读取（time 倒序）。</summary>
+    public List<Models.MockRequestEventRow> MockRequestEventGetAll()
+    {
+        var list = new List<Models.MockRequestEventRow>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT event_id, event_key, path_pattern, method, body_json, query_string,
+                   time, decided_at, status, attempts, mock_rule_id, mock_rule_desc, rule_json
+            FROM mock_request_events ORDER BY time DESC
+            """;
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            list.Add(new Models.MockRequestEventRow
+            {
+                EventId = reader.GetInt64(0),
+                Key = reader.GetString(1),
+                PathPattern = reader.GetString(2),
+                Method = reader.GetString(3),
+                BodyJson = reader.GetString(4),
+                QueryString = reader.GetString(5),
+                Time = reader.GetString(6),
+                DecidedAt = reader.IsDBNull(7) ? null : reader.GetString(7),
+                Status = reader.GetString(8),
+                Attempts = reader.GetInt32(9),
+                MockRuleId = reader.GetString(10),
+                MockRuleDescription = reader.GetString(11),
+                RuleJson = reader.GetString(12),
+            });
+        }
+        return list;
+    }
+
+    /// <summary>单条插入/更新（按 event_key upsert）。</summary>
+    public void MockRequestEventUpsert(Models.MockRequestEventRow e)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO mock_request_events(event_id, event_key, path_pattern, method, body_json, query_string,
+                time, decided_at, status, attempts, mock_rule_id, mock_rule_desc, rule_json)
+            VALUES($e,$k,$p,$m,$b,$q,$t,$d,$s,$a,$r,$rd,$rj)
+            ON CONFLICT(event_key) DO UPDATE SET
+                event_id=excluded.event_id, path_pattern=excluded.path_pattern, method=excluded.method,
+                body_json=excluded.body_json, query_string=excluded.query_string, time=excluded.time,
+                decided_at=excluded.decided_at, status=excluded.status, attempts=excluded.attempts,
+                mock_rule_id=excluded.mock_rule_id, mock_rule_desc=excluded.mock_rule_desc, rule_json=excluded.rule_json
+            """;
+        cmd.Parameters.AddWithValue("$e", e.EventId);
+        cmd.Parameters.AddWithValue("$k", e.Key);
+        cmd.Parameters.AddWithValue("$p", e.PathPattern);
+        cmd.Parameters.AddWithValue("$m", e.Method);
+        cmd.Parameters.AddWithValue("$b", e.BodyJson);
+        cmd.Parameters.AddWithValue("$q", e.QueryString);
+        cmd.Parameters.AddWithValue("$t", e.Time);
+        cmd.Parameters.AddWithValue("$d", (object?)e.DecidedAt ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$s", e.Status);
+        cmd.Parameters.AddWithValue("$a", e.Attempts);
+        cmd.Parameters.AddWithValue("$r", e.MockRuleId);
+        cmd.Parameters.AddWithValue("$rd", e.MockRuleDescription);
+        cmd.Parameters.AddWithValue("$rj", e.RuleJson);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>按 event_key 删除一条。</summary>
+    public void MockRequestEventRemove(string key)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM mock_request_events WHERE event_key = $k";
+        cmd.Parameters.AddWithValue("$k", key);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>清除已处理（非 Pending）记录；未审批的 Pending 保留。</summary>
+    public void MockRequestEventClearProcessed()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM mock_request_events WHERE status != 'Pending'";
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>条数上限：超过 max 时删除最旧的非 Pending 记录（Pending 保留，上限只约束已处理记录）。</summary>
+    public void MockRequestEventTrim(int max)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM mock_request_events
+            WHERE status != 'Pending' AND event_key IN (
+                SELECT event_key FROM mock_request_events WHERE status != 'Pending'
+                ORDER BY time DESC, event_key DESC
+                LIMIT -1 OFFSET MAX(0, $max - (SELECT COUNT(*) FROM mock_request_events WHERE status = 'Pending'))
+            )
+            """;
+        cmd.Parameters.AddWithValue("$max", max);
+        cmd.ExecuteNonQuery();
+    }
+
+    // ── 模块执行记录（module_exec_logs 表，内存环形缓冲 + SQLite）──
+
+    /// <summary>插入一条并返回自增 Id。</summary>
+    public long ModuleExecLogInsert(string taskId, string point, string module, bool ok, int httpCode, string detail)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO module_exec_logs(task_id, point, module, ok, http_code, detail, created_at)
+            VALUES($t,$p,$m,$o,$h,$d,$c);
+            SELECT last_insert_rowid()
+            """;
+        cmd.Parameters.AddWithValue("$t", taskId);
+        cmd.Parameters.AddWithValue("$p", point);
+        cmd.Parameters.AddWithValue("$m", module);
+        cmd.Parameters.AddWithValue("$o", ok ? 1 : 0);
+        cmd.Parameters.AddWithValue("$h", httpCode);
+        cmd.Parameters.AddWithValue("$d", detail);
+        cmd.Parameters.AddWithValue("$c", DateTime.Now.ToString("O"));
+        return (long)cmd.ExecuteScalar()!;
+    }
+
+    /// <summary>读取最近 max 条（id 倒序）。</summary>
+    public List<Models.ModuleExecLogRow> ModuleExecLogGetRecent(int max)
+    {
+        var list = new List<Models.ModuleExecLogRow>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, task_id, point, module, ok, http_code, detail, created_at FROM module_exec_logs ORDER BY id DESC LIMIT $max";
+        cmd.Parameters.AddWithValue("$max", max);
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            list.Add(new Models.ModuleExecLogRow
+            {
+                Id = reader.GetInt64(0),
+                TaskId = reader.GetString(1),
+                Point = reader.GetString(2),
+                Module = reader.GetString(3),
+                Ok = reader.GetInt32(4) != 0,
+                HttpCode = reader.GetInt32(5),
+                Detail = reader.GetString(6),
+                CreatedAt = reader.GetString(7),
+            });
+        }
+        return list;
+    }
+
+    /// <summary>条数上限：只保留最近 max 条（按 id）。</summary>
+    public void ModuleExecLogTrim(int max)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            DELETE FROM module_exec_logs WHERE id NOT IN (
+                SELECT id FROM module_exec_logs ORDER BY id DESC LIMIT $max
+            )
+            """;
+        cmd.Parameters.AddWithValue("$max", max);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>清空已处理：只删除成功（HTTP 2xx）记录，失败/异常记录保留。</summary>
+    public void ModuleExecLogClearProcessed()
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM module_exec_logs WHERE ok = 1";
+        cmd.ExecuteNonQuery();
     }
 }

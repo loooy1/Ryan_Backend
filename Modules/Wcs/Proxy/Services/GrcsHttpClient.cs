@@ -26,9 +26,33 @@ public class GrcsHttpClient
     public Task<(bool Ok, int StatusCode, string Json)> SendTaskGroupAsync(string baseUrl, WcsTaskGroup payload)
         => PostAsync($"{baseUrl.TrimEnd('/')}/api/v1/task_receive", payload);
 
-    /// <summary>车辆任务（/api/RawOrder/ChangeFloor，MOVE_ONLY 纯移动）。</summary>
-    public Task<(bool Ok, int StatusCode, string Json)> SendVehicleOrderAsync(string baseUrl, VehicleOrderRequest payload)
-        => PostAsync($"{baseUrl.TrimEnd('/')}/api/RawOrder/ChangeFloor", payload);
+    /// <summary>车辆任务（/api/RawOrder/ChangeFloor，MOVE_ONLY 纯移动）。
+    /// 超时 7 秒：必须早于前端 dispatch 限时（8 秒），保证超时时后端先落失败日志、前后端判定一致。</summary>
+    public async Task<(bool Ok, int StatusCode, string Json)> SendVehicleOrderAsync(string baseUrl, VehicleOrderRequest payload)
+    {
+        try
+        {
+            var c = NewClient();
+            c.Timeout = TimeSpan.FromSeconds(7);
+            var resp = await c.PostAsJsonAsync($"{baseUrl.TrimEnd('/')}/api/RawOrder/ChangeFloor", payload);
+            var body = await resp.Content.ReadAsStringAsync();
+            return (resp.IsSuccessStatusCode, (int)resp.StatusCode, body);
+        }
+        catch (Exception ex) { return (false, 0, JsonSerializer.Serialize(new { error = ex.Message })); }
+    }
+
+    /// <summary>查询全部车辆及当前状态（GET /api/Vehicle/GetAllVehicles，归巢模式用）。</summary>
+    public async Task<(bool Ok, int StatusCode, string Json)> QueryVehiclesAsync(string baseUrl, string scene)
+    {
+        var url = $"{baseUrl.TrimEnd('/')}/api/Vehicle/GetAllVehicles?sceneName={Uri.EscapeDataString(scene)}";
+        try
+        {
+            var resp = await NewClient().GetAsync(url);
+            var body = await resp.Content.ReadAsStringAsync();
+            return (resp.IsSuccessStatusCode, (int)resp.StatusCode, body);
+        }
+        catch (Exception ex) { return (false, 0, JsonSerializer.Serialize(new { error = ex.Message })); }
+    }
 
     /// <summary>库存查询（/api/Cargo，支持编码/场景/锁定过滤 + 分页）。</summary>
     public async Task<(bool Ok, int StatusCode, string Json)> QueryCargoInventoryAsync(string baseUrl, string scene,

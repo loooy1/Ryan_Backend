@@ -145,6 +145,9 @@ if (rule.BoardSync)
                 }
                 catch (Exception ex) { _logger.LogError(ex, "BoardSync 落库异常: {Raw}", rawPath); }
             }
+            // 自动通过（无需审批）的命中同样记录到请求信号页（持久化，重启不丢）
+            if (!rule.RequiresApproval && _mockApproval != null)
+                _mockApproval.RecordAutoPass(rule, bodyJson ?? "", HttpContext.Request.QueryString.Value ?? "");
             var body2 = RenderPlaceholders(rule.ResponseBody, HttpContext.Request.Query, bodyJson);
             _logger.LogInformation("Mock 命中 {Method} {Path} 规则 {Id} 返回 {Code}", method, rawPath, rule.Id, rule.ResponseCode);
             try

@@ -43,20 +43,21 @@ public static class MapStationTypeBits
     public const int Other = 512;
 }
 
-/// <summary>选点范围配置（与前端 AutoRangeConfig 同构；范围开启后只从限定池抽点）。</summary>
+/// <summary>选点范围配置（与前端 AutoRangeConfig 同构；范围开启后只从限定池抽点）。
+/// 简化后仅按 楼层 + Mark 白名单 过滤（站点类型不再参与）。</summary>
 public class RangeConfigDto
 {
     public bool Enabled { get; set; }
+    /// <summary>历史遗留字段（不再参与过滤，统一为 0）。</summary>
     public int TypeFilter { get; set; }
     public int FloorFilter { get; set; }
     public List<string> Marks { get; set; } = [];
 
-    /// <summary>按范围限制过滤候选站点池（类型位 + 楼层 + Mark 白名单，AND 关系）。</summary>
+    /// <summary>按范围限制过滤候选站点池（楼层 + Mark 白名单，AND 关系）。</summary>
     public List<MapStationLite> ApplyTo(IEnumerable<MapStationLite> stations)
     {
         if (!Enabled) return stations.ToList();
         IEnumerable<MapStationLite> pool = stations;
-        if (TypeFilter != 0) pool = pool.Where(s => (s.StationType & TypeFilter) != 0);
         if (FloorFilter != 0) pool = pool.Where(s => s.Floor == FloorFilter);
         if (Marks.Count > 0)
         {
@@ -82,6 +83,62 @@ public class InventoryCountsDto
     public int LoadedPallets { get; set; }
     public int Cargos { get; set; }
     public int PairedCargos { get; set; }
+}
+
+/// <summary>库存明细条目（仅列出有货/托的储位，不包含空储位）。</summary>
+public class InventoryDetailItem
+{
+    /// <summary>容器号（托盘号或货物号）。</summary>
+    public string Code { get; set; } = "";
+    /// <summary>当前所在站点（空 = 在途/无站点记录）。</summary>
+    public string? Station { get; set; }
+    /// <summary>带货托关联的货物号（纯空托/纯货物为 null）。</summary>
+    public string? CargoCode { get; set; }
+}
+
+/// <summary>库存分类汇总 + 明细（GET /api/wcs/auto/inventory-summary）。</summary>
+public class InventorySummaryDto
+{
+    public int Empty { get; set; }
+    public int Loaded { get; set; }
+    public int Cargo { get; set; }
+    /// <summary>锁定中 = 移动单元数（货+托同任务算一个；含选点未下发的单元）。</summary>
+    public int Locked { get; set; }
+    public List<InventoryDetailItem> EmptyItems { get; set; } = [];
+    public List<InventoryDetailItem> LoadedItems { get; set; } = [];
+    public List<InventoryDetailItem> CargoItems { get; set; } = [];
+    public List<InventoryDetailItem> LockedItems { get; set; } = [];
+}
+
+/// <summary>请求信号事件持久化行（mock_request_events 表）。</summary>
+public class MockRequestEventRow
+{
+    public long EventId { get; set; }
+    public string Key { get; set; } = "";
+    public string PathPattern { get; set; } = "";
+    public string Method { get; set; } = "";
+    public string BodyJson { get; set; } = "";
+    public string QueryString { get; set; } = "";
+    public string Time { get; set; } = "";
+    public string? DecidedAt { get; set; }
+    public string Status { get; set; } = "Pending";
+    public int Attempts { get; set; }
+    public string MockRuleId { get; set; } = "";
+    public string MockRuleDescription { get; set; } = "";
+    public string RuleJson { get; set; } = "";
+}
+
+/// <summary>模块执行记录持久化行（module_exec_logs 表）。</summary>
+public class ModuleExecLogRow
+{
+    public long Id { get; set; }
+    public string TaskId { get; set; } = "";
+    public string Point { get; set; } = "";
+    public string Module { get; set; } = "";
+    public bool Ok { get; set; }
+    public int HttpCode { get; set; }
+    public string Detail { get; set; } = "";
+    public string CreatedAt { get; set; } = "";
 }
 
 /// <summary>日志条目（自动化/批量执行共用，带自增 Id 供前端 sinceId 增量拉取）。</summary>
@@ -253,6 +310,72 @@ public class VehicleOrderRequest
     public int Priority { get; set; }
     public List<string> StationCodes { get; set; } = [];
     public string ErrorCode { get; set; } = "";
+}
+
+/// <summary>车辆信息（GRCS /api/Vehicle/GetAllVehicles 的 VehicleView 解析）。</summary>
+public class VehicleInfoDto
+{
+    public string Name { get; set; } = "";
+    public string ExecutionState { get; set; } = "";
+    public string UtilizationState { get; set; } = "";
+    public string CurrentTransportOrder { get; set; } = "";
+    public bool IsOnline { get; set; }
+    public double Power { get; set; }
+    public double X { get; set; }
+    public double Y { get; set; }
+    public double Z { get; set; }
+    public string Location { get; set; } = "";
+
+    /// <summary>归巢就绪判定：在线 + 空闲 + 自动调度 + 无当前任务。</summary>
+    public bool IsReady => IsOnline
+        && string.Equals(ExecutionState, "IDLE", StringComparison.OrdinalIgnoreCase)
+        && string.Equals(UtilizationState, "AUTOMATIC", StringComparison.OrdinalIgnoreCase)
+        && string.IsNullOrWhiteSpace(CurrentTransportOrder);
+}
+
+/// <summary>归巢模式配置（巢点站点 Mark，SQLite 持久化）。</summary>
+public class NestConfigDto
+{
+    public string? NestMark { get; set; }
+}
+
+/// <summary>归巢模式状态（SignalR NestStats 广播 + GET nest/status）。</summary>
+public class NestStatsDto
+{
+    public bool Running { get; set; }
+    public string? LastRunAt { get; set; }
+    public List<string> ReadyVehicles { get; set; } = [];
+    public int Ok { get; set; }
+    public int Fail { get; set; }
+    public string? LastError { get; set; }
+}
+
+/// <summary>异常记录（AGV/软件异常台账，纯 HTTP 读写）。</summary>
+public class ExceptionRecordDto
+{
+    public long Id { get; set; }
+    /// <summary>发生时间（ISO 字符串，yyyy-MM-dd HH:mm:ss）。</summary>
+    public string HappenedAt { get; set; } = "";
+    /// <summary>车号（可空，记录是哪台车出的问题）。</summary>
+    public string? VehicleCode { get; set; }
+    /// <summary>现象。</summary>
+    public string Phenomenon { get; set; } = "";
+    /// <summary>原因。</summary>
+    public string Reason { get; set; } = "";
+    /// <summary>责任部门（必填，RCS / WCS / Quicktron）。</summary>
+    public string ResponsibleDept { get; set; } = "";
+    /// <summary>是否解决。</summary>
+    public bool Resolved { get; set; }
+    /// <summary>最近复现时间（可空）。</summary>
+    public string? ReproducedAt { get; set; }
+    /// <summary>复现次数。</summary>
+    public int ReproduceCount { get; set; }
+}
+
+/// <summary>异常记录-复现请求体（VehicleCode 覆盖车号，空串=清空）。</summary>
+public class ExceptionRecordReproduceRequest
+{
+    public string? VehicleCode { get; set; }
 }
 
 /// <summary>站点锁条目（流程终点任务 FINISHED 后释放）。</summary>

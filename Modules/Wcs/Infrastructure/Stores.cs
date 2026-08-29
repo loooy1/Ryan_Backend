@@ -65,12 +65,22 @@ public class RangeConfigService
         catch { }
     }
 
-    public RangeConfigDto Get() { lock (_lock) { return JsonSerializer.Deserialize<RangeConfigDto>(JsonSerializer.Serialize(_range))!; } }
+    public RangeConfigDto Get()
+    {
+        lock (_lock)
+        {
+            var copy = JsonSerializer.Deserialize<RangeConfigDto>(JsonSerializer.Serialize(_range))!;
+            copy.TypeFilter = 0;   // 站点类型过滤已废弃
+            return copy;
+        }
+    }
 
     public void Set(RangeConfigDto range)
     {
         lock (_lock)
         {
+            // 站点类型过滤已废弃：写入时强制清零（清理历史遗留值）
+            range.TypeFilter = 0;
             _range = range;
             _db.KvSet("auto_range", JsonSerializer.Serialize(_range));
         }
@@ -106,6 +116,41 @@ public class WcsSettingsService
             _settings.GrcsBaseUrl = string.IsNullOrWhiteSpace(s.GrcsBaseUrl) ? _settings.GrcsBaseUrl : s.GrcsBaseUrl.Trim();
             _settings.SceneName = s.SceneName ?? "";
             _db.KvSet("wcs_settings", JsonSerializer.Serialize(_settings));
+        }
+    }
+}
+
+/// <summary>归巢模式配置（巢点站点 Mark，内存 + SQLite 持久化）。Singleton。</summary>
+public class NestConfigService
+{
+    private static readonly JsonSerializerOptions Opts = new() { PropertyNameCaseInsensitive = true };
+    private readonly AutomationDb _db;
+    private readonly object _lock = new();
+    private NestConfigDto _config = new();
+
+    public NestConfigService(AutomationDb db)
+    {
+        _db = db;
+        try
+        {
+            var json = _db.KvGet("nest_config");
+            if (!string.IsNullOrEmpty(json))
+                _config = JsonSerializer.Deserialize<NestConfigDto>(json, Opts) ?? new NestConfigDto();
+        }
+        catch { }
+    }
+
+    public NestConfigDto Get()
+    {
+        lock (_lock) { return new NestConfigDto { NestMark = _config.NestMark }; }
+    }
+
+    public void Set(NestConfigDto config)
+    {
+        lock (_lock)
+        {
+            _config.NestMark = string.IsNullOrWhiteSpace(config.NestMark) ? null : config.NestMark.Trim();
+            _db.KvSet("nest_config", JsonSerializer.Serialize(_config));
         }
     }
 }
@@ -225,4 +270,24 @@ public class SignalConfirmStore
         => _db.WorkflowGetAll()
             .GroupBy(r => r.Kind)
             .ToDictionary(g => g.Key, g => g.ToList());
+}
+
+/// <summary>异常记录台账（SQLite exception_records 表，纯 HTTP 读写）。Singleton。</summary>
+public class ExceptionRecordStore
+{
+    private readonly AutomationDb _db;
+
+    public ExceptionRecordStore(AutomationDb db) => _db = db;
+
+    public long Add(Models.ExceptionRecordDto rec) => _db.ExceptionRecordInsert(rec);
+
+    public List<Models.ExceptionRecordDto> GetAll(string? vehicle = null, string? dateFrom = null, string? dateTo = null, bool? resolved = null, string? dept = null)
+        => _db.ExceptionRecordGetAll(vehicle, dateFrom, dateTo, resolved, dept);
+
+    public void Update(Models.ExceptionRecordDto rec) => _db.ExceptionRecordUpdate(rec);
+
+    /// <summary>复现三联动：次数 +1、复现时间=当前、置为未解决。</summary>
+    public void Reproduce(long id, string? vehicleCode) => _db.ExceptionRecordReproduce(id, vehicleCode);
+
+    public void Remove(long id) => _db.ExceptionRecordRemove(id);
 }

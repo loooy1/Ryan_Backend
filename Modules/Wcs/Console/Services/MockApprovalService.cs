@@ -1,11 +1,16 @@
 using System.Text.Json;
+using GrcsBackend.Modules.Wcs.Infrastructure;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
+using GrcsBackend.Modules.Wcs.Realtime;
+using Microsoft.AspNetCore.SignalR;
 
 namespace GrcsBackend.Modules.Wcs.Console.Services;
 
 /// <summary>
 /// 通用 Mock 审批服务：任意 Mock 卡片（RequiresApproval=true）命中时生成一条请求任务，
 /// 前端在信号交互→请求信号中逐条批准/拒绝，审批结果控制 ResponseBody 中 ApprovalVariable 变量。
+/// 每次变更（新增/归并/决策/删除/清空/放行换 Key）经 SignalR 广播全量 MockRequestEvents，
+/// 前端信号交互页订阅后整表替换，零轮询。
 /// </summary>
 public class MockApprovalService
 {
@@ -31,12 +36,71 @@ public class MockApprovalService
     private long _seq;
     private readonly Dictionary<string, MockRequestEvent> _events = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, bool> _decisions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly AutomationDb _db;
+    private readonly IHubContext<TaskStageRealtimeHub> _hub;
+    private const int MaxEvents = 500;
+
+    public MockApprovalService(AutomationDb db, IHubContext<TaskStageRealtimeHub> hub)
+    {
+        _db = db;
+        _hub = hub;
+        try
+        {
+            foreach (var row in _db.MockRequestEventGetAll())
+            {
+                var ev = new MockRequestEvent
+                {
+                    Id = row.EventId,
+                    Key = row.Key,
+                    PathPattern = row.PathPattern,
+                    Method = row.Method,
+                    BodyJson = row.BodyJson,
+                    QueryString = row.QueryString,
+                    Time = DateTime.TryParse(row.Time, out var t) ? t : DateTime.Now,
+                    DecidedAt = row.DecidedAt != null && DateTime.TryParse(row.DecidedAt, out var dt) ? dt : null,
+                    Status = row.Status,
+                    Attempts = row.Attempts,
+                    MockRuleId = row.MockRuleId,
+                    MockRuleDescription = row.MockRuleDescription,
+                    RuleJson = row.RuleJson,
+                };
+                _events[ev.Key] = ev;
+                if (ev.Id > _seq) _seq = ev.Id;
+            }
+        }
+        catch { }
+    }
+
+    private void Persist(MockRequestEvent e)
+        => _db.MockRequestEventUpsert(new MockRequestEventRow
+        {
+            EventId = e.Id,
+            Key = e.Key,
+            PathPattern = e.PathPattern,
+            Method = e.Method,
+            BodyJson = e.BodyJson,
+            QueryString = e.QueryString,
+            Time = e.Time.ToString("O"),
+            DecidedAt = e.DecidedAt?.ToString("O"),
+            Status = e.Status,
+            Attempts = e.Attempts,
+            MockRuleId = e.MockRuleId,
+            MockRuleDescription = e.MockRuleDescription,
+            RuleJson = e.RuleJson,
+        });
 
     public int PendingCount { get { lock (_lock) return _events.Values.Count(e => e.Status == "Pending"); } }
 
     public List<MockRequestEvent> GetEvents()
     {
         lock (_lock) return _events.Values.OrderByDescending(e => e.Time).ToList();
+    }
+
+    /// <summary>广播全量事件快照（低频变更，整表推送，前端整表替换天然无重复）。</summary>
+    private void BroadcastEvents()
+    {
+        var events = GetEvents();
+        _ = _hub.Clients.All.SendAsync("MockRequestEvents", events);
     }
 
     /// <summary>命中需审批的 Mock 时调用：按 RuleId+BodyHash 生成 Key，首次 Pending，后续 Attempts++。
@@ -61,6 +125,9 @@ public class MockApprovalService
                     _events.Remove(key);
                     existing.Key = $"{key}#{existing.Id}";
                     _events[existing.Key] = existing;
+                    _db.MockRequestEventRemove(key);
+                    Persist(existing);
+                    BroadcastEvents();
                     return (true, true);
                 }
                 if (existing.Status == "Rejected") return (true, false);
@@ -71,12 +138,20 @@ public class MockApprovalService
                 pending0.Time = DateTime.Now;
                 pending0.BodyJson = bodyJson ?? "";      // 刷新为最新一次命中请求
                 pending0.QueryString = queryString ?? "";
+                Persist(pending0);
+                BroadcastEvents();
                 return (false, false);
             }
 
             if (_decisions.TryGetValue(key, out var allow))
             {
-                if (_events.TryGetValue(key, out var ev)) ev.Status = allow ? "Allowed" : "Rejected";
+                if (_events.TryGetValue(key, out var ev))
+                {
+                    ev.Status = allow ? "Allowed" : "Rejected";
+                    ev.DecidedAt = DateTime.Now;
+                    Persist(ev);
+                }
+                BroadcastEvents();
                 return (true, allow);
             }
             // 未审批则生成/累加 Pending 任务
@@ -97,6 +172,9 @@ public class MockApprovalService
                     MockRuleDescription = rule.Description,
                     RuleJson = JsonSerializer.Serialize(rule)
                 };
+                Persist(_events[key]);
+                _db.MockRequestEventTrim(MaxEvents);
+                BroadcastEvents();
             }
             else
             {
@@ -104,8 +182,49 @@ public class MockApprovalService
                 pending.Time = DateTime.Now;
                 pending.BodyJson = bodyJson ?? "";      // 刷新为最新一次命中请求
                 pending.QueryString = queryString ?? "";
+                Persist(pending);
+                BroadcastEvents();
             }
             return (false, false);
+        }
+    }
+
+    /// <summary>命中无需审批的 Mock 时调用：同样生成一条 AutoPass 记录（同 Key 归并 Attempts++），供请求信号页查看。</summary>
+    public void RecordAutoPass(MockRuleDto rule, string bodyJson, string queryString)
+    {
+        var key = ComputeKey(rule, bodyJson, queryString);
+        lock (_lock)
+        {
+            if (_events.TryGetValue(key, out var ev))
+            {
+                ev.Attempts++;
+                ev.Time = DateTime.Now;
+                ev.BodyJson = bodyJson ?? "";
+                ev.QueryString = queryString ?? "";
+                ev.DecidedAt = DateTime.Now;
+                Persist(ev);
+                BroadcastEvents();
+                return;
+            }
+            _events[key] = new MockRequestEvent
+            {
+                Id = ++_seq,
+                Key = key,
+                PathPattern = rule.PathPattern,
+                Method = rule.Method,
+                BodyJson = bodyJson ?? "",
+                QueryString = queryString ?? "",
+                Time = DateTime.Now,
+                DecidedAt = DateTime.Now,
+                Status = "AutoPass",
+                Attempts = 1,
+                MockRuleId = rule.Id,
+                MockRuleDescription = rule.Description,
+                RuleJson = JsonSerializer.Serialize(rule)
+            };
+            Persist(_events[key]);
+            _db.MockRequestEventTrim(MaxEvents);
+            BroadcastEvents();
         }
     }
 
@@ -118,12 +237,30 @@ public class MockApprovalService
             {
                 // 决策立即反映到状态（Approved/Rejected），GRCS 下次重试时消费并返回审批结果
                 ev.Status = allow ? "Approved" : "Rejected";
+                ev.DecidedAt = DateTime.Now;
+                Persist(ev);
             }
+            BroadcastEvents();
         }
     }
 
-    public void RemoveEvent(string key) { lock (_lock) { _events.Remove(key); _decisions.Remove(key); } }
-    public void ClearAll() { lock (_lock) { _events.Clear(); _decisions.Clear(); } }
+    public void RemoveEvent(string key) { lock (_lock) { _events.Remove(key); _decisions.Remove(key); _db.MockRequestEventRemove(key); BroadcastEvents(); } }
+
+    /// <summary>清除已处理（非 Pending）事件；未审批的 Pending 保留。</summary>
+    public void ClearAll()
+    {
+        lock (_lock)
+        {
+            var pending = _events.Where(kv => kv.Value.Status == "Pending").Select(kv => kv.Key).ToHashSet();
+            foreach (var key in _events.Keys.Where(k => !pending.Contains(k)).ToList())
+            {
+                _events.Remove(key);
+                _decisions.Remove(key);
+            }
+            _db.MockRequestEventClearProcessed();
+            BroadcastEvents();
+        }
+    }
 
     /// <summary>审批事件 Key（RuleId + 剔除时间字段后的请求指纹）；重试请求因 msgTime 不同不再漂移，稳定归并为同一条。</summary>
     public static string ComputeKey(MockRuleDto rule, string bodyJson, string queryString)
