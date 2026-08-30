@@ -26,10 +26,11 @@ public class AutomationConsoleController : ControllerBase
     private readonly MoveLoopRunner _moveLoop;
     private readonly NestRunner _nest;
     private readonly NestConfigService _nestConfig;
+    private readonly GrcsHttpClient _grcs;
 
     public AutomationConsoleController(AutoTemplateRunner auto, AutoTemplateStore templates, AutomationLogService logs,
         RangeConfigService rangeConfig, WcsSettingsService settings, SignalAutoHostedService signals,
-        MoveLoopRunner moveLoop, NestRunner nest, NestConfigService nestConfig)
+        MoveLoopRunner moveLoop, NestRunner nest, NestConfigService nestConfig, GrcsHttpClient grcs)
     {
         _auto = auto;
         _templates = templates;
@@ -40,6 +41,7 @@ public class AutomationConsoleController : ControllerBase
         _moveLoop = moveLoop;
         _nest = nest;
         _nestConfig = nestConfig;
+        _grcs = grcs;
     }
 
     /// <summary>库存分类汇总 + 明细（纯空托 / 带货托 / 纯货物 / 锁定中=移动单元数），按「以前逻辑」在后端统计。</summary>
@@ -207,7 +209,7 @@ public class AutomationConsoleController : ControllerBase
         return Ok(new { success = true });
     }
 
-    // ── 归巢模式（查询就绪车 → 巢点附近普通路点 → 逐台 MOVE_ONLY 指定车下发）──
+    // ── 归巢模式（地图框选巢区 → 持续调度：区域外就绪车逐台 MOVE_ONLY 到区内空点，直到点全被占用）──
 
     [HttpGet("nest/config")]
     public ActionResult<NestConfigDto> NestConfig() => Ok(_nestConfig.Get());
@@ -219,12 +221,45 @@ public class AutomationConsoleController : ControllerBase
         return Ok(new { success = true });
     }
 
-    /// <summary>执行一次归巢（后台异步批量下发，运行中重复调用被忽略）。</summary>
+    /// <summary>执行归巢（后台持续调度，运行中重复调用被忽略）。Vehicles = 本次车队（前端多选车名，可空 = 自动捕获当前就绪车）。</summary>
     [HttpPost("nest/run")]
-    public ActionResult<object> NestRun()
+    public ActionResult<object> NestRun([FromBody] NestRunRequest? req)
     {
-        var (ok, reason) = _nest.Run();
+        var (ok, reason) = _nest.Run(req?.Vehicles);
         return Ok(new { success = ok, reason });
+    }
+
+    /// <summary>GRCS 全部车辆（归巢车辆多选用；含就绪状态 IsReady）。</summary>
+    [HttpGet("vehicles")]
+    public async Task<ActionResult<object>> Vehicles()
+    {
+        var settings = _settings.Get();
+        if (settings == null || string.IsNullOrWhiteSpace(settings.GrcsBaseUrl))
+            return BadRequest(new { ok = false, reason = "未配置 GRCS 地址（地图信息页系统设置）" });
+        var (ok, code, json) = await _grcs.QueryVehiclesAsync(settings.GrcsBaseUrl, settings.SceneName);
+        if (!ok)
+            return BadRequest(new { ok = false, code, reason = code == 0 ? "查询车辆超时/网络异常" : $"查询车辆 HTTP {code}" });
+        try
+        {
+            var vehicles = JsonSerializer.Deserialize<List<VehicleInfoDto>>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true,
+                Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            }) ?? [];
+            return Ok(new { ok = true, vehicles });
+        }
+        catch (Exception ex)
+        {
+            return BadRequest(new { ok = false, reason = $"车辆解析失败：{ex.Message}" });
+        }
+    }
+
+    /// <summary>停止归巢（中断等待与后续下发，已下发的不撤销）。</summary>
+    [HttpPost("nest/stop")]
+    public ActionResult<object> NestStop()
+    {
+        _nest.Stop();
+        return Ok(new { success = true });
     }
 
     [HttpGet("nest/status")]
@@ -232,6 +267,7 @@ public class AutomationConsoleController : ControllerBase
 }
 
 public class IntervalRequest { public int Interval { get; set; } } // 秒
+public class NestRunRequest { public List<string>? Vehicles { get; set; } } // 本次归巢车队（可空 = 自动捕获）
 public class StartRequest { public string? TabId { get; set; } public List<string>? TemplateIds { get; set; } }
 public class ExecuteRequest { public string? TemplateId { get; set; } public int Count { get; set; } = 1; public int Interval { get; set; } = 0; public string? TabId { get; set; } } // 秒
 public class TabRequest { public string? TabId { get; set; } }

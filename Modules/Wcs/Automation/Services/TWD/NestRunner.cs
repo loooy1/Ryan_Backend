@@ -9,11 +9,14 @@ using Microsoft.AspNetCore.SignalR;
 namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
 
 /// <summary>
-/// 归巢模式：一次性批量下发（按钮触发）。
+/// 归巢模式：地图框选巢区（站点 Mark 列表），持续调度直到巢区内所有目标点都被车占用（按钮触发，可停止）。
 /// 流程：查 GRCS 全部车辆 → 过滤就绪车（在线 + IDLE + AUTOMATIC + 无当前任务）→
-/// 以配置的巢点为中心，取巢点同层优先的普通道路点（不够补其他楼层），
-/// 按距离取 N 个（N = 就绪车数）→ 每台车一条 MOVE_ONLY（VehicleName 指定车）串行下发。
-/// 统计/日志/状态经 SignalR（/hubs/task-stages）广播 NestStats 回推前端；运行中防重入。
+/// 用车辆坐标与巢区目标点（区域内全部启用站点，不限类型）坐标匹配 + location 精确匹配判定车是否在区内 →
+/// 区域外（车队内）就绪车逐台下发 MOVE_ONLY 到区内空目标点（同层优先最近），下发成功的点立即标记「在途」不再派车，
+/// 每轮巡检在途车：到达 → 转占用；仍在执行任务 → 永久等待（不因超时释放）；下线/报错/消失 → 释放重派。
+/// 只调度本次车队（不动态补位其他车）：框选 N 个点最多 N 台车在途，车少于目标点时占多少算多少，
+/// 车多于目标点时只保留前 N 台参与；直到区内目标点全部有车（或无车队内可调车 → 提示差 N 台结束）。
+/// 运行中可停止（POST nest/stop）。统计/日志/状态经 SignalR（/hubs/task-stages）广播 NestStats 回推前端；运行中防重入。
 /// </summary>
 public class NestRunner
 {
@@ -37,6 +40,17 @@ public class NestRunner
     private int _ok;
     private int _fail;
     private string? _lastError;
+    private int _targetTotal;
+    private int _targetOccupied;
+    private int _targetAssigned;
+    /// <summary>已下发在途的目标点（目标点 Mark → 车辆名）；车到达前该点不再派车，永久等待不因超时释放。</summary>
+    private Dictionary<string, string> _assignments = [];
+    /// <summary>本次归巢车队（用户勾选的车；未勾选时首轮自动捕获当前就绪车）。只调度车队内车，不再动态补位；车数超过巢区目标点数时只保留前 N 台。</summary>
+    private List<string> _pool = [];
+    private CancellationTokenSource? _cts;
+
+    /// <summary>轮询间隔：下发后等待车辆移动的时间。</summary>
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(8);
 
     public NestRunner(GrcsHttpClient grcs, MapStoreService map, NestConfigService nestConfig,
         WcsSettingsService settings, AutomationLogService logs, IHubContext<TaskStageRealtimeHub> hub)
@@ -62,15 +76,20 @@ public class NestRunner
                 Running = _running,
                 LastRunAt = _lastRunAt,
                 ReadyVehicles = _readyVehicles.ToList(),
+                PoolVehicles = _pool.ToList(),
                 Ok = _ok,
                 Fail = _fail,
                 LastError = _lastError,
+                TargetTotal = _targetTotal,
+                TargetOccupied = _targetOccupied,
+                TargetAssigned = _targetAssigned,
             };
         }
     }
 
-    /// <summary>执行一次归巢（异步后台）。运行中再次调用直接忽略。</summary>
-    public (bool Ok, string? Reason) Run()
+    /// <summary>执行一次归巢（异步后台）。运行中再次调用直接忽略。
+/// <paramref name="poolVehicles"/> = 本次车队车名（前端多选）；null/空 = 首轮自动捕获当前就绪车为车队。</summary>
+    public (bool Ok, string? Reason) Run(List<string>? poolVehicles = null)
     {
         lock (_stateLock)
         {
@@ -80,11 +99,29 @@ public class NestRunner
             _fail = 0;
             _lastError = null;
             _readyVehicles = [];
+            _assignments = [];
+            _targetAssigned = 0;
+            _pool = poolVehicles?.Select(v => v.Trim()).Where(v => v.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList() ?? [];
             _lastRunAt = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            _cts = new CancellationTokenSource();
         }
         _ = RunCoreAsync();
         Broadcast();
         return (true, null);
+    }
+
+    /// <summary>停止归巢（中断等待与后续下发，本轮已下发的不撤销）。</summary>
+    public void Stop()
+    {
+        lock (_stateLock)
+        {
+            if (!_running) return;
+            _cts?.Cancel();
+            _running = false;
+            _lastError = "已手动停止";
+        }
+        _logs.Add("⏹ 归巢模式已手动停止", "#fbbf24");
+        Broadcast();
     }
 
     private async Task RunCoreAsync()
@@ -98,73 +135,168 @@ public class NestRunner
                 return;
             }
 
-            // 1. 查全部车辆
-            var (vOk, vCode, vJson) = await _grcs.QueryVehiclesAsync(settings.GrcsBaseUrl, settings.SceneName);
-            if (!vOk)
-            {
-                var reason = vCode == 0 ? "⚠ 查询车辆超时/网络异常" : $"查询车辆 HTTP {vCode}";
-                _logs.Add("❌ 归巢模式：" + reason + $"\nGRCS 响应: {vJson}", "#f87171");
-                await FailAsync(reason);
-                return;
-            }
-            List<VehicleInfoDto> vehicles;
-            try { vehicles = JsonSerializer.Deserialize<List<VehicleInfoDto>>(vJson, JsonOpts) ?? []; }
-            catch { vehicles = []; }
-
-            // 2. 过滤就绪车（在线 + IDLE + AUTOMATIC + 无当前任务）
-            var ready = vehicles.Where(v => v.IsReady).ToList();
-            lock (_stateLock) { _readyVehicles = ready.Select(v => v.Name).ToList(); }
-
-            if (ready.Count == 0)
-            {
-                _logs.Add($"🧹 归巢模式：查询到 {vehicles.Count} 台车，0 台就绪（需 在线+空闲+自动+无任务），未下发", "#fbbf24");
-                await FinishAsync();
-                return;
-            }
-
-            // 3. 巢点
-            var nestMark = _nestConfig.Get().NestMark;
+            // 巢区目标点：框选区域内的全部启用站点（不限类型）
+            var marks = _nestConfig.Get().Marks;
             var stations = _map.GetStations();
-            var nest = stations.FirstOrDefault(s => string.Equals(s.Mark, nestMark, StringComparison.OrdinalIgnoreCase));
-            if (nest == null)
+            var markSet = new HashSet<string>(marks, StringComparer.OrdinalIgnoreCase);
+            var targets = stations.Where(s => markSet.Contains(s.Mark) && s.StaEnable).ToList();
+            lock (_stateLock) { _targetTotal = targets.Count; _targetOccupied = 0; }
+            if (targets.Count == 0)
             {
-                var reason = $"巢点站点「{nestMark}」不存在（站点池 {stations.Count} 个，请检查巢点设置）";
+                var reason = "巢区为空（请先在自动化任务→归巢模式用「地图框选巢区」选择区域并保存）";
                 _logs.Add("❌ 归巢模式：" + reason, "#f87171");
                 await FailAsync(reason);
                 return;
             }
 
-            // 4. 选点：普通道路点，与巢点至少间隔一个点（防拥挤），巢点同层优先按欧氏距离升序，不够补其他楼层，取 N 个
-            var roads = stations.Where(s => s.StaEnable && (s.StationType & MapStationTypeBits.NormalRoad) != 0).ToList();
-            var minSpacing = EstimateGridSpacing(roads);
-            var minDistToNest = 2 * minSpacing;
-            var candidates = roads
-                .Where(s => Math.Sqrt(Math.Pow(s.X - nest.X, 2) + Math.Pow(s.Y - nest.Y, 2)) >= minDistToNest)
-                .Select(s => new { s, d = Math.Sqrt(Math.Pow(s.X - nest.X, 2) + Math.Pow(s.Y - nest.Y, 2)) })
-                .OrderBy(x => x.s.Floor == nest.Floor ? 0 : 1)
-                .ThenBy(x => x.d)
-                .Select(x => x.s)
-                .ToList();
-            var targets = candidates.Take(ready.Count).ToList();
-
-            _logs.Add($"▶ 归巢模式开始：巢点 {nest.Mark}（{nest.Floor} 层），就绪车 {ready.Count} 台，"
-                + $"普通路点 {roads.Count} 个，候选（距巢点 ≥ {minDistToNest:0.#}，至少间隔一个点）{candidates.Count} 个，本次分配 {targets.Count} 个", "#60a5fa");
-
-            // 5. 逐台车串行下发
-            for (var i = 0; i < ready.Count; i++)
+            // 车队车数 > 巢区目标点数：只保留前 N 台参与（覆盖「未选车 → 首轮捕获就绪车」场景）
+            lock (_stateLock)
             {
-                var vehicle = ready[i];
-                var target = i < targets.Count ? targets[i] : null;
-                if (target == null)
+                if (_pool.Count > targets.Count)
                 {
-                    _logs.AddOrUpdate("[归巢·未分配]", $"车辆 {vehicle.Name}：普通路点不足，未分配目标点", "#fbbf24");
-                    continue;
+                    var truncated = _pool.Take(targets.Count).ToList();
+                    _logs.Add($"⚠️ 车队 {_pool.Count} 台 > 巢区目标点 {targets.Count} 个：仅前 {targets.Count} 台参与归巢，其余忽略（{string.Join("、", truncated)}）", "#fbbf24");
+                    _pool = truncated;
                 }
-                await DispatchAsync(vehicle, target, settings);
-                if (Running) Broadcast();
             }
+            _logs.Add($"▶ 归巢模式开始：巢区 {marks.Count} 个 Mark，启用目标点 {targets.Count} 个（不限类型），车队 {_pool.Count} 台，持续调度直到目标点全被车占用（车少于目标点时占多少算多少，不另调车）", "#60a5fa");
 
-            await FinishAsync();
+            var minSpacing = EstimateGridSpacing(targets);
+            var matchDist = Math.Max(minSpacing / 2.0, 0.5);   // 坐标匹配阈值：网格半距
+
+            while (true)
+            {
+                if (_cts != null && _cts.IsCancellationRequested)
+                {
+                    await FinishAsync("⏹ 归巢模式已停止");
+                    return;
+                }
+
+                // 1. 查全部车辆 → 就绪车
+                var (vOk, vCode, vJson) = await _grcs.QueryVehiclesAsync(settings.GrcsBaseUrl, settings.SceneName);
+                if (!vOk)
+                {
+                    var reason = vCode == 0 ? "⚠ 查询车辆超时/网络异常" : $"查询车辆 HTTP {vCode}";
+                    _logs.Add("❌ 归巢模式：" + reason + $"\nGRCS 响应: {vJson}", "#f87171");
+                    await FailAsync(reason);
+                    return;
+                }
+                List<VehicleInfoDto> vehicles;
+                try { vehicles = JsonSerializer.Deserialize<List<VehicleInfoDto>>(vJson, JsonOpts) ?? []; }
+                catch { vehicles = []; }
+                var ready = vehicles.Where(v => v.IsReady).ToList();
+                lock (_stateLock) { _readyVehicles = ready.Select(v => v.Name).ToList(); }
+
+                // 车队：未指定时首轮自动捕获当前就绪车（之后固定，只出不进）
+                if (_pool.Count == 0)
+                {
+                    lock (_stateLock) { _pool = ready.Select(v => v.Name).ToList(); }
+                    _logs.Add($"🚗 未指定车辆，自动捕获当前就绪车 {_pool.Count} 台为本次车队：{string.Join("、", _pool)}", "#60a5fa");
+                }
+
+                // 2. 判定每台就绪车所在目标点（location 精确匹配优先，坐标匹配兜底；一个点只认一台车）
+                var occupiedTargets = new HashSet<MapStationLite>();
+                foreach (var v in ready)
+                {
+                    var hit = targets.FirstOrDefault(t => string.Equals(t.Mark, v.Location, StringComparison.OrdinalIgnoreCase));
+                    if (hit != null && !occupiedTargets.Contains(hit)) occupiedTargets.Add(hit);
+                }
+                foreach (var v in ready)
+                {
+                    MapStationLite? best = null;
+                    var bestD = double.MaxValue;
+                    foreach (var t in targets)
+                    {
+                        var d = Math.Sqrt(Math.Pow(v.X - t.X, 2) + Math.Pow(v.Y - t.Y, 2));
+                        if (d < bestD) { bestD = d; best = t; }
+                    }
+                    if (best != null && bestD < matchDist && !occupiedTargets.Contains(best))
+                        occupiedTargets.Add(best);
+                }
+
+                // 3. 巡检在途车：到达 → 转为已占用；车下线/ERROR/消失/空闲但不在点 → 释放该点；仍在执行任务 → 永久等待
+                var released = new List<string>();
+                foreach (var kv in _assignments.ToList())
+                {
+                    var veh = vehicles.FirstOrDefault(v => string.Equals(v.Name, kv.Value, StringComparison.OrdinalIgnoreCase));
+                    var inPoint = veh != null
+                        && (string.Equals(veh.Location, kv.Key, StringComparison.OrdinalIgnoreCase)
+                            || targets.Any(t => string.Equals(t.Mark, kv.Key, StringComparison.OrdinalIgnoreCase)
+                                && Math.Sqrt(Math.Pow(veh.X - t.X, 2) + Math.Pow(veh.Y - t.Y, 2)) < matchDist));
+                    if (veh == null || veh.IsOnline == false || string.Equals(veh.ExecutionState, "ERROR", StringComparison.OrdinalIgnoreCase))
+                    {
+                        _assignments.Remove(kv.Key);
+                        lock (_stateLock) { _pool.Remove(kv.Value); }
+                        released.Add($"{kv.Value}（{kv.Key}）");
+                    }
+                    else if (inPoint)
+                    {
+                        _assignments.Remove(kv.Key);
+                        var hit = targets.FirstOrDefault(t => string.Equals(t.Mark, kv.Key, StringComparison.OrdinalIgnoreCase));
+                        if (hit != null && !occupiedTargets.Contains(hit)) occupiedTargets.Add(hit);
+                        _logs.Add($"✅ 车辆 {kv.Value} 已到达目标点 {kv.Key}", "#4ade80");
+                    }
+                    // 任务执行中 → 永久等待（不因超时释放）
+                }
+                if (released.Count > 0)
+                    _logs.Add($"↩ 释放目标点（车下线/报错/消失）：{string.Join("、", released)}，等待重新调度", "#fbbf24");
+
+                var assignedMarks = new HashSet<string>(_assignments.Keys, StringComparer.OrdinalIgnoreCase);
+                var freeTargets = targets.Where(t => !occupiedTargets.Contains(t) && !assignedMarks.Contains(t.Mark)).ToList();
+                var assignedVehicles = new HashSet<string>(_assignments.Values, StringComparer.OrdinalIgnoreCase);
+                var poolSet = new HashSet<string>(_pool, StringComparer.OrdinalIgnoreCase);
+                var usableReady = ready.Where(v =>
+                {
+                    if (assignedVehicles.Contains(v.Name)) return false;
+                    var nearest = targets.Select(t => Math.Sqrt(Math.Pow(v.X - t.X, 2) + Math.Pow(v.Y - t.Y, 2))).DefaultIfEmpty(double.MaxValue).Min();
+                    return nearest >= matchDist;
+                }).ToList();
+                // 只调度车队内车（不动态补位其他就绪车；车少时占多少算多少，其余点保持空闲并结束）
+                var outsideReady = usableReady.Where(v => poolSet.Contains(v.Name)).ToList();
+                lock (_stateLock) { _targetOccupied = occupiedTargets.Count; _targetAssigned = _assignments.Count; }
+                Broadcast();
+
+                // 4. 终止条件
+                if (occupiedTargets.Count >= targets.Count)
+                {
+                    _logs.Add($"✅ 归巢完成：巢区 {targets.Count} 个目标点已全部被车占用（成功 {_ok} / 失败 {_fail}）", "#4ade80");
+                    await FinishAsync(null);
+                    return;
+                }
+                if (outsideReady.Count == 0 && _assignments.Count == 0)
+                {
+                    _logs.Add($"🕓 巢区目标点 {targets.Count} 个，已占用 {occupiedTargets.Count} 个，但无区域外就绪车可调（还差 {targets.Count - occupiedTargets.Count} 台，车可能在执行任务/不在线/非空闲），本轮结束", "#fbbf24");
+                    await FinishAsync(null);
+                    return;
+                }
+
+                // 5. 逐台车队内就绪车 → 最近空目标点下发（一个点一台车；成功即标记在途，失败下轮重派）
+                var dispatched = 0;
+                foreach (var vehicle in outsideReady)
+                {
+                    if (freeTargets.Count == 0) break;
+                    var target = freeTargets
+                        .OrderBy(t => Math.Sqrt(Math.Pow(t.X - vehicle.X, 2) + Math.Pow(t.Y - vehicle.Y, 2)))
+                        .First();
+                    freeTargets.Remove(target);
+                    if (await DispatchAsync(vehicle, target, settings))
+                    {
+                        _assignments[target.Mark] = vehicle.Name;
+                        dispatched++;
+                    }
+                    lock (_stateLock) { _targetAssigned = _assignments.Count; }
+                    Broadcast();
+                }
+                _logs.Add($"🔄 本轮下发 {dispatched} 台（车队 {_pool.Count} 台），巢区占用 {occupiedTargets.Count}/{targets.Count}，在途 {_assignments.Count}，等待 {PollInterval.TotalSeconds:0} 秒后继续巡检", "#60a5fa");
+
+                // 6. 等待移动（在途车永久等待直到到达；停止时中断）
+                try { await Task.Delay(PollInterval, _cts?.Token ?? CancellationToken.None); }
+                catch (TaskCanceledException)
+                {
+                    await FinishAsync("⏹ 归巢模式已停止");
+                    return;
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -189,10 +321,9 @@ public class NestRunner
         return spacing == double.MaxValue ? 1 : spacing;
     }
 
-    private async Task DispatchAsync(VehicleInfoDto vehicle, MapStationLite target, WcsSettingsDto settings)
+    /// <summary>下发 MOVE_ONLY。true = HTTP 2xx 下发成功（点标记在途）；false = HTTP 失败/超时（点下轮重派）。</summary>
+    private async Task<bool> DispatchAsync(VehicleInfoDto vehicle, MapStationLite target, WcsSettingsDto settings)
     {
-        var nest = _map.GetStations().FirstOrDefault(s => string.Equals(s.Mark, _nestConfig.Get().NestMark, StringComparison.OrdinalIgnoreCase));
-        var dist = nest == null ? 0 : Math.Sqrt(Math.Pow(target.X - nest.X, 2) + Math.Pow(target.Y - nest.Y, 2));
         var payload = new VehicleOrderRequest
         {
             CreateTime = DateTime.Now,
@@ -219,7 +350,7 @@ public class NestRunner
             {
                 _ok++;
                 _lastError = null;
-                _logs.AddOrUpdate("[归巢·成功]", $"车辆 {vehicle.Name} → {target.Mark}（{target.Floor} 层，距巢点 {dist:0.#}m）✓ 任务号：（{payload.OrderId}）（耗时 {elapsedMs}ms）\n请求体: {bodyJson}", "#4ade80");
+                _logs.AddOrUpdate("[归巢·成功]", $"车辆 {vehicle.Name} → {target.Mark}（{target.Floor} 层）✓ 任务号：（{payload.OrderId}）（耗时 {elapsedMs}ms）\n请求体: {bodyJson}", "#4ade80");
             }
             else
             {
@@ -229,20 +360,22 @@ public class NestRunner
                 _logs.AddOrUpdate("[归巢·失败]", $"车辆 {vehicle.Name} → {target.Mark}：{reason}（{payload.OrderId}）（耗时 {elapsedMs}ms）\n请求体: {bodyJson}\nGRCS 响应: {json}", "#f87171");
             }
         }
+        return ok;
     }
 
     private void Finish() => _logs.Add($"✅ 归巢模式执行完成：共 {_readyVehicles.Count} 台车，成功 {_ok} / 失败 {_fail}", "#4ade80");
 
-    private async Task FinishAsync()
+    private async Task FinishAsync(string? summary = null)
     {
-        Finish();
-        lock (_stateLock) { _running = false; }
+        if (!string.IsNullOrEmpty(summary)) _logs.Add(summary, "#4ade80");
+        else Finish();
+        lock (_stateLock) { _running = false; _cts?.Dispose(); _cts = null; }
         Broadcast();
     }
 
     private async Task FailAsync(string reason)
     {
-        lock (_stateLock) { _lastError = reason; _running = false; }
+        lock (_stateLock) { _lastError = reason; _running = false; _cts?.Dispose(); _cts = null; }
         Broadcast();
     }
 

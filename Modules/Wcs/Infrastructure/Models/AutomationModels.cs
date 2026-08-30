@@ -333,10 +333,10 @@ public class VehicleInfoDto
         && string.IsNullOrWhiteSpace(CurrentTransportOrder);
 }
 
-/// <summary>归巢模式配置（巢点站点 Mark，SQLite 持久化）。</summary>
+/// <summary>归巢模式配置（地图框选巢区站点 Mark 列表，SQLite 持久化，与选点范围 auto_range 相互独立）。</summary>
 public class NestConfigDto
 {
-    public string? NestMark { get; set; }
+    public List<string> Marks { get; set; } = [];
 }
 
 /// <summary>归巢模式状态（SignalR NestStats 广播 + GET nest/status）。</summary>
@@ -345,9 +345,17 @@ public class NestStatsDto
     public bool Running { get; set; }
     public string? LastRunAt { get; set; }
     public List<string> ReadyVehicles { get; set; } = [];
+    /// <summary>本次锁定的车队（_pool：用户选择或首轮捕获，含截断后名单；只调度这些车）。</summary>
+    public List<string> PoolVehicles { get; set; } = [];
     public int Ok { get; set; }
     public int Fail { get; set; }
     public string? LastError { get; set; }
+    /// <summary>巢区目标点总数（区域内启用站点）。</summary>
+    public int TargetTotal { get; set; }
+    /// <summary>巢区已被车占用的目标点数。</summary>
+    public int TargetOccupied { get; set; }
+    /// <summary>已下发、车正在前往途中的目标点数（等待到达，不重复派车）。</summary>
+    public int TargetAssigned { get; set; }
 }
 
 /// <summary>异常记录（AGV/软件异常台账，纯 HTTP 读写）。</summary>

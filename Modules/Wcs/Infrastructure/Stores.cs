@@ -120,7 +120,7 @@ public class WcsSettingsService
     }
 }
 
-/// <summary>归巢模式配置（巢点站点 Mark，内存 + SQLite 持久化）。Singleton。</summary>
+/// <summary>归巢模式配置（地图框选巢区站点 Mark 列表，内存 + SQLite 持久化，与 auto_range 相互独立）。Singleton。</summary>
 public class NestConfigService
 {
     private static readonly JsonSerializerOptions Opts = new() { PropertyNameCaseInsensitive = true };
@@ -142,14 +142,18 @@ public class NestConfigService
 
     public NestConfigDto Get()
     {
-        lock (_lock) { return new NestConfigDto { NestMark = _config.NestMark }; }
+        lock (_lock) { return new NestConfigDto { Marks = _config.Marks.ToList() }; }
     }
 
     public void Set(NestConfigDto config)
     {
         lock (_lock)
         {
-            _config.NestMark = string.IsNullOrWhiteSpace(config.NestMark) ? null : config.NestMark.Trim();
+            _config.Marks = (config.Marks ?? [])
+                .Select(m => m?.Trim() ?? "")
+                .Where(m => m.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
             _db.KvSet("nest_config", JsonSerializer.Serialize(_config));
         }
     }
