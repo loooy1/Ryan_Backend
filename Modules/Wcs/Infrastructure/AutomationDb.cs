@@ -101,10 +101,23 @@ public class AutomationDb
                 vehicle_code TEXT,
                 phenomenon TEXT NOT NULL,
                 reason TEXT NOT NULL,
+                progress TEXT,
                 responsible_dept TEXT NOT NULL DEFAULT '',
-                resolved INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                project TEXT NOT NULL DEFAULT '',
                 reproduced_at TEXT,
                 reproduce_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            -- 项目记录（每日项目日程；纯 HTTP 读写，无轮询）
+            CREATE TABLE IF NOT EXISTS project_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                log_date TEXT NOT NULL,
+                content TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                project TEXT NOT NULL DEFAULT '',
+                remark TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -163,6 +176,62 @@ public class AutomationDb
             }
         }
 
+        // 迁移：老库补 progress 列（处理进度，可空）
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('exception_records') WHERE name='progress'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE exception_records ADD COLUMN progress TEXT";
+                alter.ExecuteNonQuery();
+            }
+        }
+
+        // 迁移：老库补 status 列（四态，默认未回复；按旧 resolved 列回填：已解决 → resolved）
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('exception_records') WHERE name='status'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE exception_records ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'";
+                alter.ExecuteNonQuery();
+                using var backfill = conn.CreateCommand();
+                backfill.CommandText = "UPDATE exception_records SET status = 'resolved' WHERE resolved = 1";
+                backfill.ExecuteNonQuery();
+            }
+        }
+
+        // 迁移：存量复现时间为 ISO(O) 格式（2026-...T12:34:56.789+08:00）→ 与发生时间一致的 yyyy-MM-dd HH:mm:ss
+        using (var fix = conn.CreateCommand())
+        {
+            fix.CommandText = "UPDATE exception_records SET reproduced_at = REPLACE(SUBSTR(reproduced_at, 1, 19), 'T', ' ') WHERE reproduced_at LIKE '%T%'";
+            fix.ExecuteNonQuery();
+        }
+
+        // 迁移：老库补 project 列（按项目区分；存量数据归为未分类）
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('exception_records') WHERE name='project'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE exception_records ADD COLUMN project TEXT NOT NULL DEFAULT ''";
+                alter.ExecuteNonQuery();
+            }
+        }
+        using (var check = conn.CreateCommand())
+        {
+            check.CommandText = "SELECT COUNT(*) FROM pragma_table_info('project_logs') WHERE name='project'";
+            if (Convert.ToInt64(check.ExecuteScalar()) == 0)
+            {
+                using var alter = conn.CreateCommand();
+                alter.CommandText = "ALTER TABLE project_logs ADD COLUMN project TEXT NOT NULL DEFAULT ''";
+                alter.ExecuteNonQuery();
+            }
+        }
+
         // 迁移：老库 mock_request_events 补 event_id 列（旧建表语句漏列）
         using (var check = conn.CreateCommand())
         {
@@ -201,15 +270,6 @@ public class AutomationDb
         cmd.CommandText = "INSERT INTO kv(key, value) VALUES($k, $v) ON CONFLICT(key) DO UPDATE SET value = excluded.value";
         cmd.Parameters.AddWithValue("$k", key);
         cmd.Parameters.AddWithValue("$v", value);
-        cmd.ExecuteNonQuery();
-    }
-
-    public void KvRemove(string key)
-    {
-        using var conn = Open();
-        using var cmd = conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM kv WHERE key = $k";
-        cmd.Parameters.AddWithValue("$k", key);
         cmd.ExecuteNonQuery();
     }
 
@@ -641,16 +701,18 @@ public class AutomationDb
     {
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO exception_records(happened_at, vehicle_code, phenomenon, reason, responsible_dept, resolved, reproduced_at, reproduce_count, created_at, updated_at)
-            VALUES($h,$vc,$ph,$r,$d,$rv,$rp,$rc,$c,$u)
+cmd.CommandText = """
+            INSERT INTO exception_records(happened_at, vehicle_code, phenomenon, reason, progress, responsible_dept, status, project, reproduced_at, reproduce_count, created_at, updated_at)
+            VALUES($h,$vc,$ph,$r,$pg,$d,$st,$pj,$rp,$rc,$c,$u)
             """;
         cmd.Parameters.AddWithValue("$h", rec.HappenedAt);
         cmd.Parameters.AddWithValue("$vc", (object?)rec.VehicleCode ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$ph", rec.Phenomenon ?? "");
         cmd.Parameters.AddWithValue("$r", rec.Reason ?? "");
+        cmd.Parameters.AddWithValue("$pg", (object?)rec.Progress ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$d", rec.ResponsibleDept ?? "");
-        cmd.Parameters.AddWithValue("$rv", rec.Resolved ? 1 : 0);
+        cmd.Parameters.AddWithValue("$st", string.IsNullOrWhiteSpace(rec.Status) ? "pending" : rec.Status);
+        cmd.Parameters.AddWithValue("$pj", rec.Project ?? "");
         cmd.Parameters.AddWithValue("$rp", (object?)rec.ReproducedAt ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$rc", rec.ReproduceCount);
         cmd.Parameters.AddWithValue("$c", DateTime.Now.ToString("O"));
@@ -661,13 +723,13 @@ public class AutomationDb
         return Convert.ToInt64(idc.ExecuteScalar());
     }
 
-    /// <summary>全表读取（发生时间倒序，最新在前），支持按车号/发生日期范围/是否解决/责任部门过滤。</summary>
-    public List<Models.ExceptionRecordDto> ExceptionRecordGetAll(string? vehicle = null, string? dateFrom = null, string? dateTo = null, bool? resolved = null, string? dept = null)
+    /// <summary>全表读取（发生时间倒序，最新在前），支持按车号/发生日期范围/状态/责任部门/项目过滤。</summary>
+    public List<Models.ExceptionRecordDto> ExceptionRecordGetAll(string? vehicle = null, string? dateFrom = null, string? dateTo = null, string? status = null, string? dept = null, string? project = null)
     {
         var list = new List<Models.ExceptionRecordDto>();
         using var conn = Open();
         using var cmd = conn.CreateCommand();
-        var sql = "SELECT id, happened_at, vehicle_code, phenomenon, reason, responsible_dept, resolved, reproduced_at, reproduce_count FROM exception_records";
+        var sql = "SELECT id, happened_at, vehicle_code, phenomenon, reason, progress, responsible_dept, status, project, reproduced_at, reproduce_count FROM exception_records";
         var conds = new List<string>();
         if (!string.IsNullOrWhiteSpace(vehicle))
         {
@@ -688,15 +750,30 @@ public class AutomationDb
             conds.Add("happened_at <= $dt");
             cmd.Parameters.AddWithValue("$dt", dt);
         }
-        if (resolved.HasValue)
+        if (!string.IsNullOrWhiteSpace(status))
         {
-            conds.Add("resolved = $rv");
-            cmd.Parameters.AddWithValue("$rv", resolved.Value ? 1 : 0);
+            var keys = status.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (keys.Length > 0)
+            {
+                var ps = new List<string>();
+                for (var i = 0; i < keys.Length; i++)
+                {
+                    var p = $"$st{i}";
+                    ps.Add(p);
+                    cmd.Parameters.AddWithValue(p, keys[i]);
+                }
+                conds.Add("status IN (" + string.Join(",", ps) + ")");
+            }
         }
         if (!string.IsNullOrWhiteSpace(dept))
         {
             conds.Add("responsible_dept = $d");
             cmd.Parameters.AddWithValue("$d", dept.Trim());
+        }
+        if (project != null)
+        {
+            if (project.Length == 0) conds.Add("project = ''");
+            else { conds.Add("project = $pj"); cmd.Parameters.AddWithValue("$pj", project.Trim()); }
         }
         if (conds.Count > 0) sql += " WHERE " + string.Join(" AND ", conds);
         sql += " ORDER BY happened_at DESC, id DESC";
@@ -711,13 +788,37 @@ public class AutomationDb
                 VehicleCode = reader.IsDBNull(2) ? null : reader.GetString(2),
                 Phenomenon = reader.GetString(3),
                 Reason = reader.GetString(4),
-                ResponsibleDept = reader.GetString(5),
-                Resolved = reader.GetInt32(6) != 0,
-                ReproducedAt = reader.IsDBNull(7) ? null : reader.GetString(7),
-                ReproduceCount = reader.GetInt32(8),
+                Progress = reader.IsDBNull(5) ? null : reader.GetString(5),
+                ResponsibleDept = reader.GetString(6),
+                Status = reader.GetString(7),
+                Project = reader.GetString(8),
+                ReproducedAt = reader.IsDBNull(9) ? null : reader.GetString(9),
+                ReproduceCount = reader.GetInt32(10),
             });
         }
         return list;
+    }
+
+    /// <summary>项目名去重列表（异常记录，含空串=未分类），供前端下拉。</summary>
+    public List<string> ExceptionRecordProjects()
+    {
+        var list = new List<string>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT project FROM exception_records ORDER BY project";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) list.Add(reader.GetString(0));
+        return list;
+    }
+
+    /// <summary>删除某项目下的全部异常记录。</summary>
+    public void ExceptionRecordRemoveByProject(string project)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM exception_records WHERE project = $pj";
+        cmd.Parameters.AddWithValue("$pj", project);
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>更新一条记录（现象/原因/责任部门/是否解决/复现时间/复现次数）。</summary>
@@ -727,7 +828,7 @@ public class AutomationDb
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE exception_records
-            SET happened_at=$h, vehicle_code=$vc, phenomenon=$ph, reason=$r, responsible_dept=$d, resolved=$rv, reproduced_at=$rp, reproduce_count=$rc, updated_at=$u
+            SET happened_at=$h, vehicle_code=$vc, phenomenon=$ph, reason=$r, progress=$pg, responsible_dept=$d, status=$st, project=$pj, reproduced_at=$rp, reproduce_count=$rc, updated_at=$u
             WHERE id=$id
             """;
         cmd.Parameters.AddWithValue("$id", rec.Id);
@@ -735,8 +836,10 @@ public class AutomationDb
         cmd.Parameters.AddWithValue("$vc", (object?)rec.VehicleCode ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$ph", rec.Phenomenon ?? "");
         cmd.Parameters.AddWithValue("$r", rec.Reason ?? "");
+        cmd.Parameters.AddWithValue("$pg", (object?)rec.Progress ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$d", rec.ResponsibleDept ?? "");
-        cmd.Parameters.AddWithValue("$rv", rec.Resolved ? 1 : 0);
+        cmd.Parameters.AddWithValue("$st", string.IsNullOrWhiteSpace(rec.Status) ? "pending" : rec.Status);
+        cmd.Parameters.AddWithValue("$pj", rec.Project ?? "");
         cmd.Parameters.AddWithValue("$rp", (object?)rec.ReproducedAt ?? DBNull.Value);
         cmd.Parameters.AddWithValue("$rc", rec.ReproduceCount);
         cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
@@ -744,7 +847,7 @@ public class AutomationDb
     }
 
     /// <summary>
-/// 复现三联动：复现次数 +1、复现时间=当前、自动置为未解决。
+/// 复现两联动：复现次数 +1、复现时间=当前（不影响状态）。
 /// vehicleCode 追加进车号历史（逗号分隔去重；空/null 不追加），不清空原历史。
 /// </summary>
     public void ExceptionRecordReproduce(long id, string? vehicleCode)
@@ -753,7 +856,7 @@ public class AutomationDb
         using var cmd = conn.CreateCommand();
         cmd.CommandText = """
             UPDATE exception_records
-            SET reproduce_count = reproduce_count + 1, reproduced_at=$rp, resolved=0, updated_at=$u,
+            SET reproduce_count = reproduce_count + 1, reproduced_at=$rp, updated_at=$u,
                 vehicle_code = CASE
                     WHEN $vc IS NULL OR $vc = '' THEN vehicle_code
                     WHEN vehicle_code IS NULL THEN $vc
@@ -764,7 +867,7 @@ public class AutomationDb
             """;
         cmd.Parameters.AddWithValue("$id", id);
         cmd.Parameters.AddWithValue("$vc", string.IsNullOrWhiteSpace(vehicleCode) ? DBNull.Value : vehicleCode.Trim());
-        cmd.Parameters.AddWithValue("$rp", DateTime.Now.ToString("O"));
+        cmd.Parameters.AddWithValue("$rp", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
         cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
         cmd.ExecuteNonQuery();
     }
@@ -950,6 +1053,130 @@ public class AutomationDb
         using var conn = Open();
         using var cmd = conn.CreateCommand();
         cmd.CommandText = "DELETE FROM module_exec_logs WHERE ok = 1";
+        cmd.ExecuteNonQuery();
+    }
+
+    // ── Project Logs（项目记录：每日项目日程）──
+
+    /// <summary>新增一条项目日程，返回自增 Id。</summary>
+    public long ProjectLogInsert(Models.ProjectLogDto rec)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO project_logs(log_date, content, status, project, remark, created_at, updated_at)
+            VALUES($d,$c,$st,$pj,$rm,$t,$t)
+            """;
+        cmd.Parameters.AddWithValue("$d", rec.LogDate);
+        cmd.Parameters.AddWithValue("$c", rec.Content ?? "");
+        cmd.Parameters.AddWithValue("$st", string.IsNullOrWhiteSpace(rec.Status) ? "pending" : rec.Status);
+        cmd.Parameters.AddWithValue("$pj", rec.Project ?? "");
+        cmd.Parameters.AddWithValue("$rm", (object?)rec.Remark ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$t", DateTime.Now.ToString("O"));
+        cmd.ExecuteNonQuery();
+        using var idc = conn.CreateCommand();
+        idc.CommandText = "SELECT last_insert_rowid()";
+        return Convert.ToInt64(idc.ExecuteScalar());
+    }
+
+    /// <summary>读取日程列表（日期倒序，最新在前），支持按日期范围/状态/项目过滤。</summary>
+    public List<Models.ProjectLogDto> ProjectLogGetAll(string? dateFrom = null, string? dateTo = null, string? status = null, string? project = null)
+    {
+        var list = new List<Models.ProjectLogDto>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        var sql = "SELECT id, log_date, content, status, project, remark, created_at, updated_at FROM project_logs";
+        var conds = new List<string>();
+        if (!string.IsNullOrWhiteSpace(dateFrom))
+        {
+            conds.Add("log_date >= $df");
+            cmd.Parameters.AddWithValue("$df", dateFrom.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(dateTo))
+        {
+            conds.Add("log_date <= $dt");
+            cmd.Parameters.AddWithValue("$dt", dateTo.Trim());
+        }
+        if (!string.IsNullOrWhiteSpace(status))
+        {
+            conds.Add("status = $st");
+            cmd.Parameters.AddWithValue("$st", status.Trim());
+        }
+        if (project != null)
+        {
+            if (project.Length == 0) conds.Add("project = ''");
+            else { conds.Add("project = $pj"); cmd.Parameters.AddWithValue("$pj", project.Trim()); }
+        }
+        if (conds.Count > 0) sql += " WHERE " + string.Join(" AND ", conds);
+        sql += " ORDER BY log_date DESC, id DESC";
+        cmd.CommandText = sql;
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            list.Add(new Models.ProjectLogDto
+            {
+                Id = reader.GetInt64(0),
+                LogDate = reader.GetString(1),
+                Content = reader.GetString(2),
+                Status = reader.GetString(3),
+                Project = reader.GetString(4),
+                Remark = reader.IsDBNull(5) ? null : reader.GetString(5),
+                CreatedAt = reader.GetString(6),
+                UpdatedAt = reader.GetString(7),
+            });
+        }
+        return list;
+    }
+
+    /// <summary>项目名去重列表（项目记录，含空串=未分类），供前端下拉。</summary>
+    public List<string> ProjectLogProjects()
+    {
+        var list = new List<string>();
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT DISTINCT project FROM project_logs ORDER BY project";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read()) list.Add(reader.GetString(0));
+        return list;
+    }
+
+    /// <summary>删除某项目下的全部项目记录。</summary>
+    public void ProjectLogRemoveByProject(string project)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM project_logs WHERE project = $pj";
+        cmd.Parameters.AddWithValue("$pj", project);
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>更新一条日程（日期/内容/状态/备注）。</summary>
+    public void ProjectLogUpdate(Models.ProjectLogDto rec)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE project_logs
+            SET log_date=$d, content=$c, status=$st, project=$pj, remark=$rm, updated_at=$u
+            WHERE id=$id
+            """;
+        cmd.Parameters.AddWithValue("$id", rec.Id);
+        cmd.Parameters.AddWithValue("$d", rec.LogDate);
+        cmd.Parameters.AddWithValue("$c", rec.Content ?? "");
+        cmd.Parameters.AddWithValue("$st", string.IsNullOrWhiteSpace(rec.Status) ? "pending" : rec.Status);
+        cmd.Parameters.AddWithValue("$pj", rec.Project ?? "");
+        cmd.Parameters.AddWithValue("$rm", (object?)rec.Remark ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("$u", DateTime.Now.ToString("O"));
+        cmd.ExecuteNonQuery();
+    }
+
+    /// <summary>删除一条日程。</summary>
+    public void ProjectLogRemove(long id)
+    {
+        using var conn = Open();
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM project_logs WHERE id = $id";
+        cmd.Parameters.AddWithValue("$id", id);
         cmd.ExecuteNonQuery();
     }
 }

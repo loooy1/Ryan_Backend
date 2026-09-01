@@ -7,7 +7,7 @@ using GrcsBackend.Modules.Wcs.Proxy.Services;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+namespace GrcsBackend.Modules.Wcs.Automation.Services;
 
 /// <summary>
 /// 自动化模板执行引擎（取代旧的硬编码两段式 AutoRunHostedService + ContainerTaskRunner）。

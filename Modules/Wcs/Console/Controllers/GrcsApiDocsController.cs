@@ -2,7 +2,7 @@ using GrcsBackend.Modules.Wcs.Infrastructure;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using Microsoft.AspNetCore.Mvc;
 
-namespace GrcsBackend.Modules.Wcs.Console.Controllers.TWD;
+namespace GrcsBackend.Modules.Wcs.Console.Controllers;
 
 /// <summary>
 /// GRCS 接口说明清单（/api/wcs/grcs-api-docs）。

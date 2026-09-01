@@ -1,11 +1,11 @@
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Infrastructure;
-using GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+using GrcsBackend.Modules.Wcs.Automation.Services;
 using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
 
-namespace GrcsBackend.Modules.Wcs.Console.Controllers.TWD;
+namespace GrcsBackend.Modules.Wcs.Console.Controllers;
 
 /// <summary>
 /// 自动化控制台接口（/api/wcs/auto/*，供前端遥控；不是 GRCS 协议接口）。
@@ -107,30 +107,7 @@ public class AutomationConsoleController : ControllerBase
         return Ok(new { interval = _auto.Interval });
     }
 
-    /// <summary>单次执行：立即按模板执行 count 次（步间间隔 interval 秒）。</summary>
-    [HttpPost("execute")]
-    public async Task<ActionResult<object>> Execute([FromBody] ExecuteRequest req)
-    {
-        await _auto.ExecuteOnce(req.TemplateId, req.Count, (req.Interval) * 1000, req.TabId);
-        return Ok(new { success = true });
-    }
-
     // ── 自动化模板 CRUD（跨浏览器共享，存 auto_templates 表）──
-
-    [HttpGet("templates")]
-    public ActionResult<List<AutoTemplateDto>> Templates() => Ok(_templates.GetAll());
-
-    /// <summary>整体替换（前端保存全部模板后整体回写）。保存前校验各步骤引用的任务模板其起点/终点类型
-    /// 在选点范围内存在对应站点，校验失败返回 400 并附带错误列表（前端据此提示，不在运行时跳过）。</summary>
-    [HttpPut("templates")]
-    public ActionResult<object> SaveTemplates([FromBody] List<AutoTemplateDto> items)
-    {
-        var errors = _auto.ValidateTemplates(items ?? []);
-        if (errors.Count > 0)
-            return BadRequest(new { success = false, errors });
-        _templates.ReplaceAll(items ?? []);
-        return Ok(new { success = true, count = _templates.GetAll().Count });
-    }
 
     /// <summary>单条保存（新建或更新），只动当前模板，不影响其他行。</summary>
     [HttpPut("templates/{id}")]
@@ -261,19 +238,14 @@ public class AutomationConsoleController : ControllerBase
         _nest.Stop();
         return Ok(new { success = true });
     }
-
-    [HttpGet("nest/status")]
-    public ActionResult<NestStatsDto> NestStatus() => Ok(_nest.Snapshot());
 }
 
 public class IntervalRequest { public int Interval { get; set; } } // 秒
 public class NestRunRequest { public List<string>? Vehicles { get; set; } } // 本次归巢车队（可空 = 自动捕获）
 public class StartRequest { public string? TabId { get; set; } public List<string>? TemplateIds { get; set; } }
-public class ExecuteRequest { public string? TemplateId { get; set; } public int Count { get; set; } = 1; public int Interval { get; set; } = 0; public string? TabId { get; set; } } // 秒
 public class TabRequest { public string? TabId { get; set; } }
 public class SignalFlagsRequest
 {
-    public bool? AdmittanceAuto { get; set; }
     public bool? ArrivalAuto { get; set; }
     public bool? RemovalAuto { get; set; }
     public bool? AutoSend { get; set; }

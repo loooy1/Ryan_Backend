@@ -1,4 +1,4 @@
-using GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+using GrcsBackend.Modules.Wcs.Automation.Services;
 using GrcsBackend.Modules.Wcs.Console.Models;
 using GrcsBackend.Modules.Wcs.Console.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -38,10 +38,6 @@ public class WcsConsoleController : ControllerBase
         _stages.RemoveByTaskId(taskId);
         return Ok(new { success = true, taskId });
     }
-
-    /// <summary>通用 Mock 审批事件列表（任意 URL 且 RequiresApproval=true 时生成）。</summary>
-    [HttpGet("mock-approvals")]
-    public ActionResult<List<MockApprovalService.MockRequestEvent>> MockApprovals() => Ok(_mockApproval.GetEvents());
 
     [HttpPost("mock-approvals/decisions/{key}")]
     public ActionResult<object> DecideMock(string key, [FromBody] DecisionRequest request)

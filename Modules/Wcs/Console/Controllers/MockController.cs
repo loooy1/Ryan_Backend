@@ -25,13 +25,6 @@ public class MockRuleController : ControllerBase
         _store.ReplaceAll(items ?? []);
         return Ok(new { success = true, count = _store.GetAll().Count });
     }
-
-    [HttpDelete("{id}")]
-    public ActionResult<object> Remove(string id)
-    {
-        var ok = _store.Remove(id);
-        return Ok(new { success = ok, id });
-    }
 }
 
 /// <summary>

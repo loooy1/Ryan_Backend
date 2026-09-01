@@ -285,8 +285,14 @@ public class ExceptionRecordStore
 
     public long Add(Models.ExceptionRecordDto rec) => _db.ExceptionRecordInsert(rec);
 
-    public List<Models.ExceptionRecordDto> GetAll(string? vehicle = null, string? dateFrom = null, string? dateTo = null, bool? resolved = null, string? dept = null)
-        => _db.ExceptionRecordGetAll(vehicle, dateFrom, dateTo, resolved, dept);
+    public List<Models.ExceptionRecordDto> GetAll(string? vehicle = null, string? dateFrom = null, string? dateTo = null, string? status = null, string? dept = null, string? project = null)
+        => _db.ExceptionRecordGetAll(vehicle, dateFrom, dateTo, status, dept, project);
+
+    /// <summary>项目名去重列表（含空串=未分类）。</summary>
+    public List<string> Projects() => _db.ExceptionRecordProjects();
+
+    /// <summary>删除某项目下的全部记录。</summary>
+    public void RemoveByProject(string project) => _db.ExceptionRecordRemoveByProject(project);
 
     public void Update(Models.ExceptionRecordDto rec) => _db.ExceptionRecordUpdate(rec);
 
@@ -294,4 +300,27 @@ public class ExceptionRecordStore
     public void Reproduce(long id, string? vehicleCode) => _db.ExceptionRecordReproduce(id, vehicleCode);
 
     public void Remove(long id) => _db.ExceptionRecordRemove(id);
+}
+
+/// <summary>项目记录（SQLite project_logs 表，纯 HTTP 读写）。Singleton。</summary>
+public class ProjectLogStore
+{
+    private readonly AutomationDb _db;
+
+    public ProjectLogStore(AutomationDb db) => _db = db;
+
+    public long Add(Models.ProjectLogDto rec) => _db.ProjectLogInsert(rec);
+
+    public List<Models.ProjectLogDto> GetAll(string? dateFrom = null, string? dateTo = null, string? status = null, string? project = null)
+        => _db.ProjectLogGetAll(dateFrom, dateTo, status, project);
+
+    /// <summary>项目名去重列表（含空串=未分类）。</summary>
+    public List<string> Projects() => _db.ProjectLogProjects();
+
+    /// <summary>删除某项目下的全部记录。</summary>
+    public void RemoveByProject(string project) => _db.ProjectLogRemoveByProject(project);
+
+    public void Update(Models.ProjectLogDto rec) => _db.ProjectLogUpdate(rec);
+
+    public void Remove(long id) => _db.ProjectLogRemove(id);
 }

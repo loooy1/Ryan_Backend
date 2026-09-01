@@ -6,7 +6,7 @@ using GrcsBackend.Modules.Wcs.Proxy.Services;
 using GrcsBackend.Modules.Wcs.Realtime;
 using Microsoft.AspNetCore.SignalR;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+namespace GrcsBackend.Modules.Wcs.Automation.Services;
 
 /// <summary>
 /// 归巢模式：地图框选巢区（站点 Mark 列表），持续调度直到巢区内所有目标点都被车占用（按钮触发，可停止）。
@@ -75,7 +75,6 @@ public class NestRunner
             {
                 Running = _running,
                 LastRunAt = _lastRunAt,
-                ReadyVehicles = _readyVehicles.ToList(),
                 PoolVehicles = _pool.ToList(),
                 Ok = _ok,
                 Fail = _fail,

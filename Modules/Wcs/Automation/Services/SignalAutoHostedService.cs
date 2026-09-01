@@ -3,7 +3,7 @@ using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Infrastructure;
 using GrcsBackend.Modules.Wcs.Console.Services;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+namespace GrcsBackend.Modules.Wcs.Automation.Services;
 
 /// <summary>
 /// 信号自动放行服务（由前端 SignalAutoService 平移，Skill E：leader 模式整个删除，后端天然唯一）。

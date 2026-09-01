@@ -6,7 +6,7 @@ using GrcsBackend.Modules.Wcs.Proxy.Services;
 using GrcsBackend.Modules.Wcs.Realtime;
 using Microsoft.AspNetCore.SignalR;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+namespace GrcsBackend.Modules.Wcs.Automation.Services;
 
 /// <summary>
 /// 纯移动任务循环（MOVE_ONLY）后端执行引擎。

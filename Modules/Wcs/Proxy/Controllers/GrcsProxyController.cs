@@ -2,7 +2,7 @@ using System.Text.Json;
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Infrastructure;
-using GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+using GrcsBackend.Modules.Wcs.Automation.Services;
 using Microsoft.AspNetCore.Mvc;
 
 namespace GrcsBackend.Modules.Wcs.Proxy.Controllers;

@@ -23,7 +23,6 @@ namespace GrcsBackend.Modules.Wcs.Console.Services;
 public interface ITaskStageService
 {
     void Record(TaskStageChangeModel change);
-    List<StageChangeEvent> GetEvents(int limit = 200);
     /// <summary>增量查询：只返回 Id 大于 sinceId 的阶段事件（前端轮询收敛用）。</summary>
     List<StageChangeEvent> GetEventsSince(long sinceId, int limit = 1000);
     /// <summary>写创建行（stage=CREATED，来自下发台账；同一任务只写一条，重复调用跳过）。</summary>
@@ -45,11 +44,8 @@ public interface ITaskStageService
     /// <summary>等待任务到达 FINISHED（进程内事件驱动，默认无限等待；传入 timeout 才会限时）。</summary>
     Task WaitFinishedAsync(string taskId, TimeSpan? timeout = null);
 
-    /// <summary>强制完成所有等待中的 FINISHED 等待器（用于强制结束）。</summary>
+/// <summary>强制完成所有等待中的 FINISHED 等待器（用于强制结束）。</summary>
     void ForceCompleteAll();
-
-    /// <summary>强制完成指定任务的 FINISHED 等待器。</summary>
-    void ForceComplete(string taskId);
 }
 
 public class TaskStageService : ITaskStageService
@@ -158,19 +154,6 @@ public class TaskStageService : ITaskStageService
         _ = _hub.Clients.All.SendAsync("EventAdded", rec);
     }
 
-    public List<StageChangeEvent> GetEvents(int limit = 200)
-    {
-        lock (_lock)
-        {
-            return _records.Where(r => !r.IsCreated).TakeLast(limit).Select(r => r.ToStageEvent()).ToList();
-        }
-    }
-
-    /// <summary>
-    /// 增量查询：只返回 Id 大于 sinceId 的阶段事件，最多 limit 条。
-    /// 前端 TaskStageHub 每轮携带上次水位调用，把"每秒全量拉 200 条"降为"只传新增几条"，
-    /// 是全应用唯一轮询器（前端 6 处消费方共享）的配套后端能力。
-    /// </summary>
     public List<StageChangeEvent> GetEventsSince(long sinceId, int limit = 1000)
     {
         lock (_lock)
@@ -231,22 +214,6 @@ public class TaskStageService : ITaskStageService
 
     private static string DedupKey(string taskId, string stage, DateTime time)
         => $"{taskId}|{stage}|{time.Ticks}";
-
-    /// <summary>
-    /// 等待任务到达 FINISHED：进程内事件驱动（GRCS 回调 task_stage_change 直达本进程），
-    /// 比前端方案（HTTP 轮询 task-stages）更快更准。注册等待器后由 Record 的 FINISHED 分支唤醒。
-    /// 默认无限等待；显式传 timeout 才限时（超时抛 TimeoutException）。
-    /// </summary>
-    public void ForceComplete(string taskId)
-    {
-        TaskCompletionSource<bool>? tcs = null;
-        lock (_lock)
-        {
-            _finished.Add(taskId);
-            if (_waiters.Remove(taskId, out tcs)) { }
-        }
-        tcs?.TrySetResult(true);
-    }
 
     public void ForceCompleteAll()
     {

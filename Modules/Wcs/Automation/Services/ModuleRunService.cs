@@ -5,7 +5,7 @@ using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 using Microsoft.Extensions.Logging;
 
-namespace GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+namespace GrcsBackend.Modules.Wcs.Automation.Services;
 
 /// <summary>
 /// 统一模块执行引擎（取代前端 ModuleRunnerService + TaskDispatch 客户端模块执行）。

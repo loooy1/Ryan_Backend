@@ -1,5 +1,5 @@
 using GrcsBackend.Modules.Wcs.Infrastructure;
-using GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+using GrcsBackend.Modules.Wcs.Automation.Services;
 using GrcsBackend.Modules.Wcs.Console.Services;
 using GrcsBackend.Modules.Wcs.Proxy.Services;
 
@@ -26,6 +26,7 @@ public static class WcsModuleExtensions
         services.AddSingleton<LedgerStore>();
         services.AddSingleton<SignalConfirmStore>();
         services.AddSingleton<ExceptionRecordStore>();
+        services.AddSingleton<ProjectLogStore>();
         services.AddSingleton<TaskTemplateStore>();
         services.AddSingleton<FeatureModuleStore>();
         services.AddSingleton<AutoTemplateStore>();

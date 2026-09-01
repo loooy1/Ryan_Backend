@@ -1,4 +1,4 @@
-using GrcsBackend.Modules.Wcs.Automation.Services.TWD;
+using GrcsBackend.Modules.Wcs.Automation.Services;
 using GrcsBackend.Modules.Wcs.Infrastructure;
 using GrcsBackend.Modules.Wcs.Infrastructure.Models;
 using Microsoft.AspNetCore.Mvc;
@@ -75,14 +75,6 @@ public class FeatureModuleController : ControllerBase
     {
         var ok = _store.Remove(id);
         return Ok(new { success = ok, id });
-    }
-
-    /// <summary>模块执行记录（sinceId &gt; 0 只返回新条目；不带返回最近 500 条，Id 最大值为水位）。所有任务（手动 + 自动化）的三类模块统一在后端执行，结果进此处。</summary>
-    [HttpGet("logs")]
-    public ActionResult<object> ModuleExecLogs([FromQuery] long? sinceId)
-    {
-        var entries = sinceId is > 0 ? _execLog.GetSince(sinceId.Value) : _execLog.GetSince(0);
-        return Ok(new { maxId = _execLog.MaxId, entries });
     }
 
     /// <summary>清空已处理：只删除成功（HTTP 2xx）的模块执行记录，失败/异常记录保留（广播剩余快照实时同步前端）。</summary>
